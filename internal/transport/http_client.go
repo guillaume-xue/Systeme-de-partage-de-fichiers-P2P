@@ -3,22 +3,19 @@ package transport
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"main/internal/crypto"
+	"main/internal/protocol"
+	"net"
 	"net/http"
 	"strings"
 	"time"
 )
 
-const (
-	URL       = "https://jch.irif.fr:8443/peers/"
-	ServerUDP = "[2001:660:3301:9243::51c2:1ee5]:8443" // Adresse UDP du serveur
-	MyName    = "Gui"                                  // Votre nom de pair
-)
-
 func GetListPeers() ([]string, error) {
-	resp, err := http.Get(URL)
+	resp, err := http.Get(protocol.URL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get peers: %w", err)
 	}
@@ -41,7 +38,7 @@ func GetListPeers() ([]string, error) {
 }
 
 func GetAddr(name string) (string, error) {
-	resp, err := http.Get(URL + name + "/addresses")
+	resp, err := http.Get(protocol.URL + name + "/addresses")
 	if err != nil {
 		return "", fmt.Errorf("failed to get address: %w", err)
 	}
@@ -55,7 +52,7 @@ func GetAddr(name string) (string, error) {
 }
 
 func GetKey(name string) ([]byte, error) {
-	resp, err := http.Get(URL + name + "/key")
+	resp, err := http.Get(protocol.URL + name + "/key")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get key: %w", err)
 	}
@@ -72,7 +69,7 @@ func RegisterHTTP(privateKey *ecdsa.PrivateKey) error {
 	pubKey := crypto.ExtractPublicKey(privateKey)
 	pubBytes := crypto.PublicKeyToBytes(pubKey)
 
-	url := fmt.Sprintf(URL + MyName + "/key")
+	url := fmt.Sprintf(protocol.URL + protocol.MyName + "/key")
 	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(pubBytes))
 	if err != nil {
 		return err
@@ -90,5 +87,41 @@ func RegisterHTTP(privateKey *ecdsa.PrivateKey) error {
 		return fmt.Errorf("erreur serveur HTTP: %s", resp.Status)
 	}
 
+	return nil
+}
+
+func SendHello(conn *net.UDPConn, destAddr *net.UDPAddr, myName string, privKey *ecdsa.PrivateKey) error {
+	bodyBuf := new(bytes.Buffer)
+
+	extensions := uint32(0)
+	binary.Write(bodyBuf, binary.BigEndian, extensions)
+
+	bodyBuf.Write([]byte(myName))
+	body := bodyBuf.Bytes()
+
+	msg := protocol.Messages{
+		ID:     uint32(time.Now().Unix()),
+		Type:   protocol.Hello,
+		Length: uint16(len(body)),
+	}
+
+	headerBuf := new(bytes.Buffer)
+	binary.Write(headerBuf, binary.BigEndian, msg.ID)
+	binary.Write(headerBuf, binary.BigEndian, msg.Type)
+	binary.Write(headerBuf, binary.BigEndian, msg.Length)
+	header := headerBuf.Bytes()
+
+	dataToSign := append(header, body...)
+
+	signature := crypto.ComputeSignature(privKey, dataToSign)
+
+	packet := append(dataToSign, signature...)
+
+	_, err := conn.WriteToUDP(packet, destAddr)
+	if err != nil {
+		return fmt.Errorf("erreur envoi Hello: %w", err)
+	}
+
+	fmt.Printf("Hello envoyé à %s (ID:%d)\n", destAddr, msg.ID)
 	return nil
 }

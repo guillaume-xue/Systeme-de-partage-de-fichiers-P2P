@@ -3,39 +3,35 @@ package main
 import (
 	"fmt"
 	"main/internal/crypto"
+	"main/internal/protocol"
 	"main/internal/transport"
-)
-
-const (
-	FILENAME      = "client_key.pem"
-	ServerUDPAddr = "localhost:8080"
+	"net"
 )
 
 func main() {
-	privKey, _ := crypto.LoadOrGenerateKey(FILENAME)
+	privKey, _ := crypto.LoadOrGenerateKey(protocol.FILENAME)
+
+	localAddr, _ := net.ResolveUDPAddr("udp", ":8080")
+
+	conn, err := net.ListenUDP("udp", localAddr)
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+
+	fmt.Println("Port UDP 8080 ouvert pour écoute et envoi.")
+
+	go transport.ListenLoop(conn)
 
 	if err := transport.RegisterHTTP(privKey); err != nil {
 		fmt.Println("Erreur HTTP:", err)
 	}
 
-	listOfPeers, err := transport.GetListPeers()
-	if err != nil {
-		fmt.Println("Erreur lors de la récupération de la liste des pairs :", err)
-		return
+	serverAddr, _ := net.ResolveUDPAddr("udp", protocol.ServerUDP)
+	if err := transport.SendHello(conn, serverAddr, protocol.MyName, privKey); err != nil {
+		fmt.Println("Erreur envoi Hello:", err)
 	}
 
-	fmt.Println("Liste des pairs récupérée avec succès :")
-	for _, peer := range listOfPeers {
-		fmt.Println("-", peer)
-	}
+	select {}
 
-	get_key, err := transport.GetKey("Gui")
-	if err != nil {
-		fmt.Println("Erreur lors de la récupération de la clé du pair :", err)
-		return
-	}
-
-	extracted_key := crypto.ParsePublicKey(get_key)
-	bytes_key := crypto.PublicKeyToBytes(extracted_key)
-	fmt.Println("Clé publique récupérée du pair Gui :", bytes_key)
 }
