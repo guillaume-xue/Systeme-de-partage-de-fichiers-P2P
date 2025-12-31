@@ -50,7 +50,7 @@ func handlePacket(conn *net.UDPConn, remoteAddr *net.UDPAddr, data []byte) {
 
 	switch msg.Type {
 	case protocol.Hello:
-		processHello(body, signature, remoteAddr)
+		processHello(conn, body, signature, remoteAddr, msg.ID)
 	case protocol.HelloReply:
 		processHelloReply(body, signature, remoteAddr)
 	case protocol.Ping:
@@ -63,7 +63,7 @@ func handlePacket(conn *net.UDPConn, remoteAddr *net.UDPAddr, data []byte) {
 	}
 }
 
-func processHello(body []byte, signature []byte, addr *net.UDPAddr) {
+func processHello(conn *net.UDPConn, body []byte, signature []byte, addr *net.UDPAddr, msgID uint32) {
 	if len(body) < 4 {
 		fmt.Println("Hello invalide (pas d'extensions)")
 		return
@@ -78,7 +78,7 @@ func processHello(body []byte, signature []byte, addr *net.UDPAddr) {
 		fmt.Println("Hello non signé ! (Devrait être rejeté)")
 	} else {
 		fmt.Println("Signature présente.")
-		// TODO: Vérifier la signature
+		SendMessage(conn, addr, msgID, protocol.HelloReply)
 	}
 }
 

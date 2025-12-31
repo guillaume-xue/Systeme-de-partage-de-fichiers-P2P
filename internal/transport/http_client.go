@@ -90,7 +90,10 @@ func RegisterHTTP(privateKey *ecdsa.PrivateKey) error {
 	return nil
 }
 
-func SendHello(conn *net.UDPConn, destAddr *net.UDPAddr, myName string, privKey *ecdsa.PrivateKey) error {
+func SendMessage(conn *net.UDPConn, destAddr *net.UDPAddr, msgID uint32, msgType uint8) error {
+	privKey, _ := crypto.LoadOrGenerateKey(protocol.FILENAME)
+	myName := protocol.MyName
+
 	bodyBuf := new(bytes.Buffer)
 
 	extensions := uint32(0)
@@ -100,8 +103,8 @@ func SendHello(conn *net.UDPConn, destAddr *net.UDPAddr, myName string, privKey 
 	body := bodyBuf.Bytes()
 
 	msg := protocol.Messages{
-		ID:     uint32(time.Now().Unix()),
-		Type:   protocol.Hello,
+		ID:     msgID,
+		Type:   msgType,
 		Length: uint16(len(body)),
 	}
 
@@ -119,9 +122,36 @@ func SendHello(conn *net.UDPConn, destAddr *net.UDPAddr, myName string, privKey 
 
 	_, err := conn.WriteToUDP(packet, destAddr)
 	if err != nil {
-		return fmt.Errorf("erreur envoi Hello: %w", err)
+		return fmt.Errorf("erreur envoi Message: %w", err)
 	}
 
-	fmt.Printf("Hello envoyé à %s (ID:%d)\n", destAddr, msg.ID)
+	fmt.Printf("Message envoyé à %s (ID:%d)\n", destAddr, msg.ID)
 	return nil
+}
+
+func RegisterClient() {
+	privKey, _ := crypto.LoadOrGenerateKey(protocol.FILENAME)
+
+	localAddr, _ := net.ResolveUDPAddr("udp", ":8080")
+
+	conn, err := net.ListenUDP("udp", localAddr)
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+
+	fmt.Println("Port UDP 8080 ouvert pour écoute et envoi.")
+
+	go ListenLoop(conn)
+
+	if err := RegisterHTTP(privKey); err != nil {
+		fmt.Println("Erreur HTTP:", err)
+	}
+
+	serverAddr, _ := net.ResolveUDPAddr("udp", protocol.ServerUDP)
+	if err := SendMessage(conn, serverAddr, uint32(time.Now().Unix()), protocol.Hello); err != nil {
+		fmt.Println("Erreur envoi Hello:", err)
+	}
+
+	select {}
 }
