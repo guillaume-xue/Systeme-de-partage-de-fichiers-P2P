@@ -2,6 +2,7 @@ package transport
 
 import (
 	"crypto/ecdsa"
+	"encoding/binary"
 	"fmt"
 	"main/internal/protocol"
 	"net"
@@ -21,26 +22,6 @@ type NetworkConfig struct {
 }
 
 var globalNetConfig = &NetworkConfig{}
-
-// GetNetworkConfig retourne la configuration réseau globale
-func GetNetworkConfig() *NetworkConfig {
-	return globalNetConfig
-}
-
-// SetConnected marque la connexion comme établie
-func (nc *NetworkConfig) SetConnected() {
-	nc.mu.Lock()
-	defer nc.mu.Unlock()
-	nc.connected = true
-	nc.lastResponse = time.Now()
-}
-
-// IsConnected retourne si on est connecté
-func (nc *NetworkConfig) IsConnected() bool {
-	nc.mu.RLock()
-	defer nc.mu.RUnlock()
-	return nc.connected
-}
 
 // networkConfig représente une configuration réseau à essayer
 type networkConfig struct {
@@ -85,7 +66,7 @@ func buildNetworkConfigs() []networkConfig {
 
 // TryConnectWithFallback essaie de se connecter avec dual-stack d'abord, puis IPv4
 //
-// DUAL-STACK expliqué:
+// DUAL-STACK:
 // - Linux: Un socket [::]:port capture IPv4 ET IPv6 (IPv4-mapped addresses: ::ffff:x.x.x.x)
 // - Windows: Par défaut, [::]:port capture SEULEMENT IPv6 (IPV6_V6ONLY=true par défaut)
 // - Go gère automatiquement cette différence sur Windows quand on utilise "udp" (pas "udp6")
@@ -126,27 +107,15 @@ func TryConnectWithFallback(myName string, privKey *ecdsa.PrivateKey) (*net.UDPC
 		fmt.Printf("   📤 Envoi Hello au serveur %s...\n", cfg.server)
 
 		// Envoyer Hello
-		_, err = SendHello(conn, serverAddr, myName, privKey)
+		helloID, err := SendHello(conn, serverAddr, myName, privKey)
 		if err != nil {
 			fmt.Printf("   ❌ Erreur envoi Hello: %v\n", err)
 			conn.Close()
 			continue
 		}
 
-		// Attendre une réponse avec timeout
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		buffer := make([]byte, 4096)
-		n, _, err := conn.ReadFromUDP(buffer)
-		conn.SetReadDeadline(time.Time{}) // Réinitialiser le deadline
-
-		if err != nil {
-			fmt.Printf("   ❌ Pas de réponse du serveur (timeout): %v\n", err)
-			conn.Close()
-			continue
-		}
-
-		// Vérifier que c'est bien un HelloReply (type 130)
-		if n >= 7 && buffer[4] == protocol.HelloReply {
+		// Attendre une réponse avec le bon ID
+		if waitForMatchingResponse(conn, helloID, 5*time.Second) {
 			fmt.Printf("   ✅ Connexion %s établie! (HelloReply reçu)\n", cfg.name)
 
 			// Sauvegarder la config
@@ -170,10 +139,11 @@ func TryConnectWithFallback(myName string, privKey *ecdsa.PrivateKey) (*net.UDPC
 				}
 				otherAddr, err := net.ResolveUDPAddr("udp", otherServer)
 				if err == nil {
-					fmt.Printf("   📤 Envoi Hello supplémentaire à %s pour publier les deux adresses...\n", otherServer)
+					fmt.Printf("   📤 Envoi Hello supplémentaire à %s...\n", otherServer)
 					SendHello(conn, otherAddr, myName, privKey)
-					// Attendre brièvement la réponse (pas bloquant si pas de réponse)
+					// Attendre brièvement (non bloquant)
 					conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+					buffer := make([]byte, 1024)
 					conn.ReadFromUDP(buffer)
 					conn.SetReadDeadline(time.Time{})
 				}
@@ -182,11 +152,64 @@ func TryConnectWithFallback(myName string, privKey *ecdsa.PrivateKey) (*net.UDPC
 			return conn, serverAddr, nil
 		}
 
-		fmt.Printf("   ⚠️ Réponse inattendue (type=%d)\n", buffer[4])
+		fmt.Printf("   ❌ Pas de réponse valide du serveur\n")
 		conn.Close()
 	}
 
 	return nil, nil, fmt.Errorf("impossible de se connecter au serveur (toutes les méthodes ont échoué)")
+}
+
+// waitForMatchingResponse attend une réponse HelloReply, Ok ou Ping avec le bon ID
+// Cela évite de confondre une réponse d'une session précédente avec notre Hello
+func waitForMatchingResponse(conn *net.UDPConn, expectedID uint32, timeout time.Duration) bool {
+	conn.SetReadDeadline(time.Now().Add(timeout))
+	defer conn.SetReadDeadline(time.Time{})
+
+	buffer := make([]byte, 4096)
+	startTime := time.Now()
+
+	for time.Since(startTime) < timeout {
+		n, _, err := conn.ReadFromUDP(buffer)
+		if err != nil {
+			return false
+		}
+
+		// Vérifier la taille minimale (ID=4 bytes + Type=1 byte)
+		if n < 5 {
+			continue
+		}
+
+		// Extraire l'ID du message (4 premiers bytes, big-endian)
+		receivedID := binary.BigEndian.Uint32(buffer[0:4])
+
+		// Vérifier si l'ID correspond
+		if receivedID != expectedID {
+			// ID différent, c'est peut-être un paquet d'une autre session
+			// On continue à attendre
+			continue
+		}
+
+		messageType := buffer[4]
+
+		// Accepter HelloReply (130), Ok (128), ou Ping (0) comme confirmation
+		// - HelloReply: réponse normale à un Hello
+		// - Ok: réponse si on est déjà associé
+		// - Ping: le serveur peut envoyer un Ping pour vérifier qu'on est joignable
+		switch messageType {
+		case protocol.HelloReply, protocol.Ok, protocol.Ping:
+			return true
+		case protocol.Error:
+			// Erreur du serveur, afficher le message si disponible
+			if n > 7 {
+				errMsg := string(buffer[7:n])
+				fmt.Printf("   ⚠️ Erreur du serveur: %s\n", errMsg)
+			}
+			return false
+		}
+		// Autre type avec le bon ID, on continue à attendre
+	}
+
+	return false
 }
 
 // ResolveAddrWithFallback résout une adresse en essayant IPv6 puis IPv4

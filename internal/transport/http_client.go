@@ -14,80 +14,104 @@ import (
 	"time"
 )
 
-func GetListPeers() ([]string, error) {
+// FetchPeerList récupère la liste de tous les peers enregistrés sur le serveur
+func FetchPeerList() ([]string, error) {
 	resp, err := http.Get(protocol.URL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get peers: %w", err)
+		return nil, fmt.Errorf("échec récupération liste peers: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, fmt.Errorf("échec lecture réponse: %w", err)
 	}
 
-	lines := strings.Split(string(body), "\n")
-	var peers []string
+	lines := strings.Split(string(responseBody), "\n")
+	var peerNames []string
 	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			peers = append(peers, line)
+		trimmedLine := strings.TrimSpace(line)
+		if trimmedLine != "" {
+			peerNames = append(peerNames, trimmedLine)
 		}
 	}
-	return peers, nil
+	return peerNames, nil
 }
 
-func GetAddr(name string) (string, error) {
-	resp, err := http.Get(protocol.URL + name + "/addresses")
+// GetListPeers est un alias pour FetchPeerList (compatibilité)
+func GetListPeers() ([]string, error) {
+	return FetchPeerList()
+}
+
+// FetchPeerAddresses récupère les adresses UDP d'un peer par son nom
+func FetchPeerAddresses(peerName string) (string, error) {
+	resp, err := http.Get(protocol.URL + peerName + "/addresses")
 	if err != nil {
-		return "", fmt.Errorf("failed to get address: %w", err)
+		return "", fmt.Errorf("échec récupération adresses: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("failed to read response body: %w", err)
+		return "", fmt.Errorf("échec lecture réponse: %w", err)
 	}
-	return string(body), nil
+	return string(responseBody), nil
 }
 
-func GetKey(name string) ([]byte, error) {
-	resp, err := http.Get(protocol.URL + name + "/key")
+// GetAddr est un alias pour FetchPeerAddresses (compatibilité)
+func GetAddr(peerName string) (string, error) {
+	return FetchPeerAddresses(peerName)
+}
+
+// FetchPeerPublicKey récupère la clé publique d'un peer par son nom
+func FetchPeerPublicKey(peerName string) ([]byte, error) {
+	resp, err := http.Get(protocol.URL + peerName + "/key")
 	if err != nil {
-		return nil, fmt.Errorf("failed to get key: %w", err)
+		return nil, fmt.Errorf("échec récupération clé publique: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	publicKeyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, fmt.Errorf("échec lecture réponse: %w", err)
 	}
-	return body, nil
+	return publicKeyBytes, nil
 }
 
-func RegisterHTTP(privateKey *ecdsa.PrivateKey) error {
-	pubKey := crypto.ExtractPublicKey(privateKey)
-	pubBytes := crypto.PublicKeyToBytes(pubKey)
+// GetKey est un alias pour FetchPeerPublicKey (compatibilité)
+func GetKey(peerName string) ([]byte, error) {
+	return FetchPeerPublicKey(peerName)
+}
 
-	url := fmt.Sprintf(protocol.URL + protocol.MyName + "/key")
-	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(pubBytes))
+// RegisterPublicKey enregistre notre clé publique sur le serveur HTTP
+func RegisterPublicKey(privateKey *ecdsa.PrivateKey) error {
+	publicKey := crypto.ExtractPublicKey(privateKey)
+	publicKeyBytes := crypto.PublicKeyToBytes(publicKey)
+
+	registrationURL := protocol.URL + protocol.MyName + "/key"
+	request, err := http.NewRequest(http.MethodPut, registrationURL, bytes.NewReader(publicKeyBytes))
 	if err != nil {
-		return err
+		return fmt.Errorf("échec création requête: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/octet-stream")
+	request.Header.Set("Content-Type", "application/octet-stream")
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	response, err := httpClient.Do(request)
 	if err != nil {
-		return err
+		return fmt.Errorf("échec envoi requête: %w", err)
 	}
-	defer resp.Body.Close()
+	defer response.Body.Close()
 
-	if resp.StatusCode != 200 && resp.StatusCode != 204 {
-		return fmt.Errorf("erreur serveur HTTP: %s", resp.Status)
+	if response.StatusCode != 200 && response.StatusCode != 204 {
+		return fmt.Errorf("erreur serveur HTTP: %s", response.Status)
 	}
 
 	return nil
+}
+
+// RegisterHTTP est un alias pour RegisterPublicKey (compatibilité)
+func RegisterHTTP(privateKey *ecdsa.PrivateKey) error {
+	return RegisterPublicKey(privateKey)
 }
 
 // buildPacket construit un paquet UDP avec header + body + signature optionnelle

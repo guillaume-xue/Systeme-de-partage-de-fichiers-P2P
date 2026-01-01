@@ -35,6 +35,9 @@ type Server struct {
 	// Canal pour notifier les téléchargements (pour le Downloader)
 	OnDatumReceived func(hash [32]byte, datum []byte)
 
+	// Canal pour notifier la réception du root hash
+	rootHashChan chan [32]byte
+
 	// Pour l'arrêt propre
 	shutdown chan struct{}
 	running  bool
@@ -252,6 +255,10 @@ func (s *Server) processRootReply(id uint32, body []byte, signature []byte, data
 		return
 	}
 
+	if s.rootHashChan != nil {
+		s.rootHashChan <- rootHash
+	}
+
 	fmt.Printf("🌳 Root hash de %s: %x\n", peerInfo.Name, rootHash)
 }
 
@@ -399,4 +406,8 @@ func (s *Server) KeepAlive(serverAddr *net.UDPAddr, interval time.Duration) {
 			s.PeerManager.CleanExpired()
 		}
 	}
+}
+
+func (s *Server) SetRootHashChan(ch chan [32]byte) {
+	s.rootHashChan = ch
 }
