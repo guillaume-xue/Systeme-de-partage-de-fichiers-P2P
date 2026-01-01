@@ -1,9 +1,7 @@
 package transport
 
 import (
-	"bytes"
 	"crypto/ecdsa"
-	"encoding/binary"
 	"fmt"
 	"main/internal/crypto"
 	"main/internal/merkle"
@@ -57,6 +55,18 @@ func NewServer(conn *net.UDPConn, privKey *ecdsa.PrivateKey, myName string) *Ser
 		shutdown:      make(chan struct{}),
 		running:       true,
 	}
+}
+
+// AddServerAsPeer ajoute le serveur central comme peer associé
+// Appelé après une connexion réussie pour éviter de devoir se réassocier manuellement
+func (s *Server) AddServerAsPeer(serverAddr *net.UDPAddr, serverName string) {
+	// Récupérer la clé publique du serveur
+	keyBytes, err := s.getPublicKey(serverName)
+	if err != nil || len(keyBytes) != 64 {
+		return
+	}
+	pubKey := crypto.ParsePublicKey(keyBytes)
+	s.PeerManager.AddOrUpdate(serverName, serverAddr, pubKey)
 }
 
 // Stop arrête proprement le serveur
@@ -113,7 +123,7 @@ func (s *Server) ListenLoop() {
 			if !s.running {
 				return
 			}
-			fmt.Println("Erreur lecture:", err)
+			fmt.Println("❌ Erreur lecture UDP:", err)
 			continue
 		}
 
@@ -126,58 +136,40 @@ func (s *Server) ListenLoop() {
 
 // handlePacket traite un paquet reçu
 func (s *Server) handlePacket(remoteAddr *net.UDPAddr, data []byte) {
-	if len(data) < 7 {
+	// Décoder le paquet avec les structures du protocole
+	packet, err := protocol.DecodePacket(data)
+	if err != nil {
 		return
-	}
-
-	reader := bytes.NewReader(data[:7])
-	var id uint32
-	var msgType uint8
-	var length uint16
-
-	binary.Read(reader, binary.BigEndian, &id)
-	binary.Read(reader, binary.BigEndian, &msgType)
-	binary.Read(reader, binary.BigEndian, &length)
-
-	if len(data) < 7+int(length) {
-		return
-	}
-
-	body := data[7 : 7+int(length)]
-
-	var signature []byte
-	if len(data) >= 7+int(length)+64 {
-		signature = data[7+int(length) : 7+int(length)+64]
 	}
 
 	// Données à vérifier pour la signature (header + body)
-	dataToVerify := data[:7+int(length)]
+	dataToVerify := packet.DataToSign()
 
-	switch msgType {
+	switch packet.Header.Type {
 	case protocol.Hello:
-		s.processHello(id, body, signature, dataToVerify, remoteAddr)
+		s.processHello(packet.Header.ID, packet.Body, packet.Signature, dataToVerify, remoteAddr)
 	case protocol.HelloReply:
-		s.processHelloReply(id, body, signature, dataToVerify, remoteAddr)
+		s.processHelloReply(packet.Header.ID, packet.Body, packet.Signature, dataToVerify, remoteAddr)
 	case protocol.Ping:
-		SendOk(s.Conn, remoteAddr, id)
+		SendOk(s.Conn, remoteAddr, packet.Header.ID)
 	case protocol.Ok:
 		// Silencieux
 	case protocol.RootRequest:
-		s.processRootRequest(id, remoteAddr)
+		s.processRootRequest(packet.Header.ID, remoteAddr)
 	case protocol.RootReply:
-		s.processRootReply(id, body, signature, dataToVerify, remoteAddr)
+		s.processRootReply(packet.Header.ID, packet.Body, packet.Signature, dataToVerify, remoteAddr)
 	case protocol.DatumRequest:
-		s.processDatumRequest(id, body, remoteAddr)
+		s.processDatumRequest(packet.Header.ID, packet.Body, remoteAddr)
 	case protocol.Datum:
-		s.processDatum(id, body, remoteAddr)
+		s.processDatum(packet.Header.ID, packet.Body, remoteAddr)
 	case protocol.NoDatum:
-		s.processNoDatum(id, body, signature, dataToVerify, remoteAddr)
+		s.processNoDatum(packet.Header.ID, packet.Body, packet.Signature, dataToVerify, remoteAddr)
 	case protocol.Error:
-		fmt.Printf("❌ Erreur de %s: %s\n", remoteAddr, string(body))
+		fmt.Printf("❌ Erreur de %s: %s\n", remoteAddr, string(packet.Body))
 	case protocol.NatTraversalRequest:
-		s.processNatTraversalRequest(id, body, signature, dataToVerify, remoteAddr)
+		s.processNatTraversalRequest(packet.Header.ID, packet.Body, packet.Signature, dataToVerify, remoteAddr)
 	case protocol.NatTraversalRequest2:
-		s.processNatTraversalRequest2(id, body, signature, dataToVerify, remoteAddr)
+		s.processNatTraversalRequest2(packet.Header.ID, packet.Body, packet.Signature, dataToVerify, remoteAddr)
 	default:
 		// Message inconnu ignoré
 	}
@@ -185,13 +177,16 @@ func (s *Server) handlePacket(remoteAddr *net.UDPAddr, data []byte) {
 
 // processHello traite un message Hello reçu
 func (s *Server) processHello(id uint32, body []byte, signature []byte, dataToVerify []byte, addr *net.UDPAddr) {
-	if len(body) < 4 || len(signature) != 64 {
+	if len(signature) != protocol.SignatureSize {
 		return
 	}
 
-	extensions := binary.BigEndian.Uint32(body[:4])
-	remoteName := string(body[4:])
-	_ = extensions // Utilisé pour compatibilité
+	// Décoder le body avec la structure du protocole
+	extensions, remoteName, err := protocol.DecodeHelloBody(body)
+	if err != nil {
+		return
+	}
+	_ = extensions // Réservé pour extensions futures
 
 	keyBytes, err := s.getPublicKey(remoteName)
 	if err != nil || len(keyBytes) != 64 {
@@ -209,14 +204,17 @@ func (s *Server) processHello(id uint32, body []byte, signature []byte, dataToVe
 }
 
 // processHelloReply traite une réponse HelloReply
-func (s *Server) processHelloReply(id uint32, body []byte, signature []byte, dataToVerify []byte, addr *net.UDPAddr) {
-	if len(body) < 4 || len(signature) != 64 {
+func (s *Server) processHelloReply(_ uint32, body []byte, signature []byte, dataToVerify []byte, addr *net.UDPAddr) {
+	if len(signature) != protocol.SignatureSize {
 		return
 	}
 
-	extensions := binary.BigEndian.Uint32(body[:4])
-	remoteName := string(body[4:])
-	_ = extensions
+	// Décoder le body avec la structure du protocole
+	extensions, remoteName, err := protocol.DecodeHelloBody(body)
+	if err != nil {
+		return
+	}
+	_ = extensions // Réservé pour extensions futures
 
 	keyBytes, err := s.getPublicKey(remoteName)
 	if err != nil || len(keyBytes) != 64 {
@@ -238,13 +236,16 @@ func (s *Server) processRootRequest(id uint32, addr *net.UDPAddr) {
 }
 
 // processRootReply traite une réponse RootReply
-func (s *Server) processRootReply(id uint32, body []byte, signature []byte, dataToVerify []byte, addr *net.UDPAddr) {
-	if len(body) != 32 || len(signature) != 64 {
+func (s *Server) processRootReply(_ uint32, body []byte, signature []byte, dataToVerify []byte, addr *net.UDPAddr) {
+	if len(signature) != protocol.SignatureSize {
 		return
 	}
 
-	var rootHash [32]byte
-	copy(rootHash[:], body)
+	// Décoder le hash avec la structure du protocole
+	rootHash, err := protocol.DecodeHashBody(body)
+	if err != nil {
+		return
+	}
 
 	peerInfo, ok := s.PeerManager.GetByAddr(addr)
 	if !ok {
@@ -264,12 +265,11 @@ func (s *Server) processRootReply(id uint32, body []byte, signature []byte, data
 
 // processDatumRequest répond avec le datum demandé
 func (s *Server) processDatumRequest(id uint32, body []byte, addr *net.UDPAddr) {
-	if len(body) != 32 {
+	// Décoder le hash demandé
+	hash, err := protocol.DecodeHashBody(body)
+	if err != nil {
 		return
 	}
-
-	var hash [32]byte
-	copy(hash[:], body)
 
 	datum, found := s.MerkleStore.Get(hash)
 	if !found {
@@ -284,15 +284,14 @@ func (s *Server) processDatumRequest(id uint32, body []byte, addr *net.UDPAddr) 
 }
 
 // processDatum traite un Datum reçu
-func (s *Server) processDatum(id uint32, body []byte, addr *net.UDPAddr) {
-	if len(body) < 33 {
+func (s *Server) processDatum(_ uint32, body []byte, _ *net.UDPAddr) {
+	// Décoder le datum avec la structure du protocole
+	expectedHash, value, err := protocol.DecodeDatumBody(body)
+	if err != nil {
 		return
 	}
 
-	var expectedHash [32]byte
-	copy(expectedHash[:], body[:32])
-	value := body[32:]
-
+	// Vérifier l'intégrité via le hash Merkle
 	computedHash := merkle.HashData(value)
 	if computedHash != expectedHash {
 		return
@@ -306,8 +305,14 @@ func (s *Server) processDatum(id uint32, body []byte, addr *net.UDPAddr) {
 }
 
 // processNoDatum traite un NoDatum reçu
-func (s *Server) processNoDatum(id uint32, body []byte, signature []byte, dataToVerify []byte, addr *net.UDPAddr) {
-	if len(body) != 32 || len(signature) != 64 {
+func (s *Server) processNoDatum(_ uint32, body []byte, signature []byte, dataToVerify []byte, addr *net.UDPAddr) {
+	if len(signature) != protocol.SignatureSize {
+		return
+	}
+
+	// Décoder le hash
+	_, err := protocol.DecodeHashBody(body)
+	if err != nil {
 		return
 	}
 
@@ -322,26 +327,17 @@ func (s *Server) processNoDatum(id uint32, body []byte, signature []byte, dataTo
 }
 
 // processNatTraversalRequest traite une demande de NAT traversal (type 4)
-// Format du body selon 4.1.6: 6 octets (IPv4) ou 18 octets (IPv6)
 func (s *Server) processNatTraversalRequest(id uint32, body []byte, signature []byte, dataToVerify []byte, addr *net.UDPAddr) {
-	// Valider la taille du body: doit être exactement 6 (IPv4) ou 18 (IPv6) octets
-	if (len(body) != 6 && len(body) != 18) || len(signature) != 64 {
+	if len(signature) != protocol.SignatureSize {
 		return
 	}
 
-	// Décoder l'adresse cible selon la taille
-	var targetAddr *net.UDPAddr
-	if len(body) == 6 {
-		// IPv4: [0-3] IP, [4-5] port
-		ip := net.IPv4(body[0], body[1], body[2], body[3])
-		port := int(binary.BigEndian.Uint16(body[4:6]))
-		targetAddr = &net.UDPAddr{IP: ip, Port: port}
-	} else {
-		// IPv6: [0-15] IP, [16-17] port
-		ip := net.IP(body[:16])
-		port := int(binary.BigEndian.Uint16(body[16:18]))
-		targetAddr = &net.UDPAddr{IP: ip, Port: port}
+	// Décoder l'adresse cible avec la structure du protocole
+	socketAddr, err := protocol.DecodeSocketAddress(body)
+	if err != nil {
+		return
 	}
+	targetAddr := socketAddr.ToUDPAddr()
 
 	peerInfo, ok := s.PeerManager.GetByAddr(addr)
 	if !ok || !crypto.VerifySignature(peerInfo.PublicKey, dataToVerify, signature) {
@@ -353,27 +349,18 @@ func (s *Server) processNatTraversalRequest(id uint32, body []byte, signature []
 }
 
 // processNatTraversalRequest2 traite une demande de NAT traversal relay (type 5)
-// Format du body selon 4.1.6: 6 octets (IPv4) ou 18 octets (IPv6)
 // Réponse: envoie Ok à l'expéditeur, puis Ping à l'adresse contenue dans le body
-func (s *Server) processNatTraversalRequest2(id uint32, body []byte, signature []byte, dataToVerify []byte, addr *net.UDPAddr) {
-	// Valider la taille du body: doit être exactement 6 (IPv4) ou 18 (IPv6) octets
-	if (len(body) != 6 && len(body) != 18) || len(signature) != 64 {
+func (s *Server) processNatTraversalRequest2(id uint32, body []byte, signature []byte, _ []byte, addr *net.UDPAddr) {
+	if len(signature) != protocol.SignatureSize {
 		return
 	}
 
-	// Décoder l'adresse cible selon la taille
-	var targetAddr *net.UDPAddr
-	if len(body) == 6 {
-		// IPv4: [0-3] IP, [4-5] port
-		ip := net.IPv4(body[0], body[1], body[2], body[3])
-		port := int(binary.BigEndian.Uint16(body[4:6]))
-		targetAddr = &net.UDPAddr{IP: ip, Port: port}
-	} else {
-		// IPv6: [0-15] IP, [16-17] port
-		ip := net.IP(body[:16])
-		port := int(binary.BigEndian.Uint16(body[16:18]))
-		targetAddr = &net.UDPAddr{IP: ip, Port: port}
+	// Décoder l'adresse cible avec la structure du protocole
+	socketAddr, err := protocol.DecodeSocketAddress(body)
+	if err != nil {
+		return
 	}
+	targetAddr := socketAddr.ToUDPAddr()
 
 	SendOk(s.Conn, addr, id)
 	SendPing(s.Conn, targetAddr)

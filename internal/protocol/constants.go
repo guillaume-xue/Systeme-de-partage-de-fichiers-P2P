@@ -9,7 +9,7 @@ const (
 	Hello      = 1
 	HelloReply = 130
 
-	Timeout = 5
+	Timeout = 3
 
 	RootRequest = 2
 	RootReply   = 131

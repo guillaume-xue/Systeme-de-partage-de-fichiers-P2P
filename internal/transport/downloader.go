@@ -47,7 +47,7 @@ type pendingRequest struct {
 	maxRetry int
 }
 
-// NewDownloader crée un nouveau downloader
+// NewDownloader crée un nouveau gestionnaire de téléchargement
 func NewDownloader(server *Server, peerAddr *net.UDPAddr) *Downloader {
 	d := &Downloader{
 		server:        server,
@@ -302,10 +302,7 @@ func (d *Downloader) increaseWindow() {
 
 // decreaseWindow réduit la taille de la fenêtre (multiplicative decrease)
 func (d *Downloader) decreaseWindow() {
-	d.windowSize = d.windowSize / 2
-	if d.windowSize < d.minWindowSize {
-		d.windowSize = d.minWindowSize
-	}
+	d.windowSize = max(d.windowSize / 2, d.minWindowSize)
 }
 
 // DownloadTree télécharge récursivement un arbre Merkle

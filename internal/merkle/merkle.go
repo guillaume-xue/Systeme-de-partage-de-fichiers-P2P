@@ -24,11 +24,11 @@ const (
 	FileNameSize   = 32   // Taille max du nom de fichier
 )
 
-// Node représente un nœud dans l'arbre de Merkle
+// Node représente un noeud dans l'arbre de Merkle
 type Node struct {
-	Type     uint8    // Type du nœud (Chunk, Directory, Big, BigDirectory)
-	Data     []byte   // Données du nœud (contenu sérialisé)
-	Hash     [32]byte // Hash SHA-256 du nœud
+	Type     uint8    // Type du noeud (Chunk, Directory, Big, BigDirectory)
+	Data     []byte   // Données du noeud (contenu sérialisé)
+	Hash     [32]byte // Hash SHA-256 du noeud
 	Children []Node   // Enfants (pour Big et BigDirectory)
 }
 
@@ -44,6 +44,11 @@ type Store struct {
 	mu   sync.RWMutex
 }
 
+// HashData calcule le hash SHA-256 des données
+func HashData(data []byte) [32]byte {
+	return sha256.Sum256(data)
+}
+
 // NewStore crée un nouveau store vide
 func NewStore() *Store {
 	return &Store{
@@ -53,10 +58,8 @@ func NewStore() *Store {
 
 // Add ajoute un datum au store et retourne son hash
 func (s *Store) Add(datum []byte) [32]byte {
-	hash := sha256.Sum256(datum)
-	s.mu.Lock()
-	s.Data[hash] = datum
-	s.mu.Unlock()
+	hash := HashData(datum)
+	s.Set(hash, datum)
 	return hash
 }
 
@@ -97,7 +100,7 @@ func (s *Store) Delete(hash [32]byte) {
 	s.mu.Unlock()
 }
 
-// Range itère sur tous les datums (thread-safe)
+// Itération sur tous les datums (thread-safe)
 func (s *Store) Range(fn func(hash [32]byte, datum []byte) bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -108,29 +111,24 @@ func (s *Store) Range(fn func(hash [32]byte, datum []byte) bool) {
 	}
 }
 
-// HashData calcule le hash SHA-256 des données
-func HashData(data []byte) [32]byte {
-	return sha256.Sum256(data)
-}
-
-// CreateChunk crée un nœud Chunk à partir de données (≤ 1024 octets)
+// CreateChunk crée un noeud Chunk à partir de données (≤ 1024 octets)
 func CreateChunk(data []byte) ([]byte, [32]byte) {
 	if len(data) > MaxChunkSize {
-		panic("Chunk trop grand")
+		panic(fmt.Sprintf("❌ La taille du chunk dépasse %d octets", MaxChunkSize))
 	}
 	// Format: [Type (1 byte)] [Data]
 	datum := make([]byte, 1+len(data))
 	datum[0] = TypeChunk
 	copy(datum[1:], data)
 
-	hash := sha256.Sum256(datum)
+	hash := HashData(datum)
 	return datum, hash
 }
 
-// CreateBigNode crée un nœud Big à partir d'une liste de hashes enfants
+// CreateBigNode crée un noeud Big à partir d'une liste de hashes enfants
 func CreateBigNode(childHashes [][32]byte) ([]byte, [32]byte) {
 	if len(childHashes) < 2 || len(childHashes) > MaxBigChildren {
-		panic(fmt.Sprintf("Big node doit avoir 2-32 enfants, a %d", len(childHashes)))
+		panic(fmt.Sprintf("❌ Big doit avoir 2-32 enfants, a %d", len(childHashes)))
 	}
 	// Format: [Type (1 byte)] [Hash1 (32 bytes)] [Hash2 (32 bytes)] ...
 	datum := make([]byte, 1+len(childHashes)*HashSize)
@@ -139,14 +137,14 @@ func CreateBigNode(childHashes [][32]byte) ([]byte, [32]byte) {
 		copy(datum[1+i*HashSize:], h[:])
 	}
 
-	hash := sha256.Sum256(datum)
+	hash := HashData(datum)
 	return datum, hash
 }
 
-// CreateDirectoryNode crée un nœud Directory à partir d'entrées
+// CreateDirectoryNode crée un noeud Directory à partir d'entrées
 func CreateDirectoryNode(entries []DirEntry) ([]byte, [32]byte) {
 	if len(entries) > MaxDirEntries {
-		panic(fmt.Sprintf("Directory doit avoir ≤16 entrées, a %d", len(entries)))
+		panic(fmt.Sprintf("❌ Directory ne peut pas avoir plus de %d entrées, a %d", MaxDirEntries, len(entries)))
 	}
 	// Format: [Type (1 byte)] [Entry1 (64 bytes)] [Entry2 (64 bytes)] ...
 	datum := make([]byte, 1+len(entries)*DirEntrySize)
@@ -157,14 +155,14 @@ func CreateDirectoryNode(entries []DirEntry) ([]byte, [32]byte) {
 		copy(datum[offset+FileNameSize:offset+DirEntrySize], e.Hash[:])
 	}
 
-	hash := sha256.Sum256(datum)
+	hash := HashData(datum)
 	return datum, hash
 }
 
-// CreateBigDirectoryNode crée un nœud BigDirectory à partir de hashes enfants
+// CreateBigDirectoryNode crée un noeud BigDirectory à partir de hashes enfants
 func CreateBigDirectoryNode(childHashes [][32]byte) ([]byte, [32]byte) {
 	if len(childHashes) < 2 || len(childHashes) > MaxBigChildren {
-		panic(fmt.Sprintf("BigDirectory doit avoir 2-32 enfants, a %d", len(childHashes)))
+		panic(fmt.Sprintf("❌ BigDirectory doit avoir 2-32 enfants, a %d", len(childHashes)))
 	}
 	// Format: [Type (1 byte)] [Hash1 (32 bytes)] [Hash2 (32 bytes)] ...
 	datum := make([]byte, 1+len(childHashes)*HashSize)
@@ -173,7 +171,7 @@ func CreateBigDirectoryNode(childHashes [][32]byte) ([]byte, [32]byte) {
 		copy(datum[1+i*HashSize:], h[:])
 	}
 
-	hash := sha256.Sum256(datum)
+	hash := HashData(datum)
 	return datum, hash
 }
 
@@ -305,10 +303,7 @@ func buildBigDirectory(store *Store, entries []DirEntry) [32]byte {
 
 	// Créer des Directory nodes de 16 entrées max
 	for i := 0; i < len(entries); i += MaxDirEntries {
-		end := i + MaxDirEntries
-		if end > len(entries) {
-			end = len(entries)
-		}
+		end := min(i + MaxDirEntries, len(entries))
 		group := entries[i:end]
 		datum, hash := CreateDirectoryNode(group)
 		store.Add(datum)

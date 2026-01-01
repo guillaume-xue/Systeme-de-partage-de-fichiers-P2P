@@ -3,6 +3,7 @@ package transport
 import (
 	"fmt"
 	"main/internal/merkle"
+	"main/internal/utils"
 	"net"
 	"os"
 	"path/filepath"
@@ -10,11 +11,7 @@ import (
 	"time"
 )
 
-// ===========================================================================
-// DiskDownloader - Téléchargeur avec fenêtre glissante et écriture directe
-// ===========================================================================
-
-// DiskDownloader télécharge l'arborescence Merkle directement sur disque
+// DiskDownloader gère et télécharge l'arborescence Merkle directement sur disque
 // Utilise une fenêtre glissante (sliding window) pour optimiser le débit
 type DiskDownloader struct {
 	server      *Server
@@ -78,7 +75,7 @@ type downloadTask struct {
 	filePath string
 }
 
-// NewDiskDownloader crée un nouveau téléchargeur
+// NewDiskDownloader crée un nouveau gestionnaire de téléchargement
 func NewDiskDownloader(server *Server, peerAddress *net.UDPAddr, outputDir string) *DiskDownloader {
 	downloader := &DiskDownloader{
 		server:                server,
@@ -100,10 +97,6 @@ func NewDiskDownloader(server *Server, peerAddress *net.UDPAddr, outputDir strin
 	return downloader
 }
 
-// ===========================================================================
-// Contrôle du cycle de vie
-// ===========================================================================
-
 // startWorkers démarre les goroutines de travail
 func (d *DiskDownloader) startWorkers() {
 	d.waitGroup.Add(3)
@@ -119,10 +112,6 @@ func (d *DiskDownloader) stopWorkers() {
 	close(d.responseChannel)
 	d.waitGroup.Wait()
 }
-
-// ===========================================================================
-// API publique
-// ===========================================================================
 
 // QueueDownload ajoute un hash à la file de téléchargement
 func (d *DiskDownloader) QueueDownload(hash [32]byte, filePath string) {
@@ -227,16 +216,12 @@ func (d *DiskDownloader) DownloadToDisk(rootHash [32]byte) error {
 	d.stopWorkers()
 
 	// Afficher le résumé
-	fmt.Printf("\n✅ Terminé: %d fichiers, %s\n", d.filesSaved, formatBytesForDisplay(d.bytesSaved))
+	fmt.Printf("\n✅ Terminé: %d fichiers, %s\n", d.filesSaved, utils.FormatBytesInt64(d.bytesSaved))
 	if d.totalTimeouts > 0 {
 		fmt.Printf("⚠️  %d timeout(s)\n", d.totalTimeouts)
 	}
 	return nil
 }
-
-// ===========================================================================
-// Boucles de travail (goroutines)
-// ===========================================================================
 
 // requestSenderLoop envoie les requêtes DatumRequest
 func (d *DiskDownloader) requestSenderLoop() {
@@ -298,7 +283,7 @@ func (d *DiskDownloader) responseProcessorLoop() {
 		if req, isPending := d.pendingRequests[hash]; isPending {
 			if time.Since(req.sentAt) < d.requestTimeout/2 {
 				// Réponse rapide → augmenter la fenêtre
-				d.windowSize = minInt(d.windowSize+1, d.maxWindowSize)
+				d.windowSize = utils.MinInt(d.windowSize+1, d.maxWindowSize)
 			}
 			delete(d.pendingRequests, hash)
 			d.totalReceived++
@@ -356,14 +341,10 @@ func (d *DiskDownloader) timeoutMonitorLoop() {
 		for _, hash := range hashesToRetry {
 			SendDatumRequest(d.server.Conn, d.peerAddress, hash)
 			d.totalSent++
-			d.windowSize = maxInt(d.windowSize/2, d.minWindowSize)
+			d.windowSize = utils.MaxInt(d.windowSize/2, d.minWindowSize)
 		}
 	}
 }
-
-// ===========================================================================
-// Traitement des datums
-// ===========================================================================
 
 // processDatum traite un datum reçu selon son type
 func (d *DiskDownloader) processDatum(hash [32]byte, datum []byte) {
@@ -438,10 +419,6 @@ func (d *DiskDownloader) processBigFile(hash [32]byte, filePath string, data []b
 	}
 }
 
-// ===========================================================================
-// Reconstruction des fichiers Big
-// ===========================================================================
-
 // reconstructBigFiles reconstruit tous les fichiers Big après téléchargement
 func (d *DiskDownloader) reconstructBigFiles() {
 	d.bigFilesToReconstructMu.Lock()
@@ -496,10 +473,6 @@ func (d *DiskDownloader) reconstructBigFileContent(hash [32]byte) ([]byte, error
 	return nil, fmt.Errorf("type de datum non supporté: %d", nodeType)
 }
 
-// ===========================================================================
-// Affichage de la progression
-// ===========================================================================
-
 // displayProgress affiche la progression du téléchargement
 func (d *DiskDownloader) displayProgress() {
 	ticker := time.NewTicker(500 * time.Millisecond)
@@ -519,34 +492,4 @@ func (d *DiskDownloader) displayProgress() {
 		fmt.Printf("\r📊 Datums: %d | Fichiers: %d | En attente: %d   ",
 			cachedCount, d.filesSaved, pendingCount)
 	}
-}
-
-// ===========================================================================
-// Fonctions utilitaires
-// ===========================================================================
-
-// formatBytesForDisplay formate une taille en bytes de façon lisible
-func formatBytesForDisplay(byteCount int64) string {
-	if byteCount < 1024 {
-		return fmt.Sprintf("%d B", byteCount)
-	} else if byteCount < 1024*1024 {
-		return fmt.Sprintf("%.1f KB", float64(byteCount)/1024)
-	}
-	return fmt.Sprintf("%.1f MB", float64(byteCount)/(1024*1024))
-}
-
-// minInt retourne le minimum de deux entiers
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// maxInt retourne le maximum de deux entiers
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

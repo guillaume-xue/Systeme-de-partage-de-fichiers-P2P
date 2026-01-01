@@ -51,6 +51,10 @@ func main() {
 	// 4. Créer le serveur
 	server := transport.NewServer(conn, privKey, protocol.MyName)
 
+	// 4.1 Ajouter le serveur central comme peer associé automatiquement
+	// Cela évite de devoir se réassocier manuellement après une déconnexion récente
+	server.AddServerAsPeer(serverAddr, "jch.irif.fr")
+
 	// 5. Charger le dossier partagé dans le Merkle tree ou la créer s'il n'existe pas
 	sharedDir := filepath.Join(".", "shared")
 	if _, err := os.Stat(sharedDir); os.IsNotExist(err) {

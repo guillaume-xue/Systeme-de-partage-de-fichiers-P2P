@@ -8,6 +8,7 @@ import (
 	"main/internal/peer"
 	"main/internal/protocol"
 	"main/internal/transport"
+	"main/internal/utils"
 	"net"
 	"os"
 	"path/filepath"
@@ -16,7 +17,6 @@ import (
 	"time"
 )
 
-// InteractiveMenu représente l'interface utilisateur interactive
 type InteractiveMenu struct {
 	server       *transport.Server
 	serverAddr   *net.UDPAddr
@@ -24,7 +24,6 @@ type InteractiveMenu struct {
 	rootHashChan chan [32]byte
 }
 
-// NewMenu crée une nouvelle instance du menu interactif
 func NewMenu(server *transport.Server, serverAddr *net.UDPAddr) *InteractiveMenu {
 	return &InteractiveMenu{
 		server:      server,
@@ -103,27 +102,21 @@ func (m *InteractiveMenu) waitForEnterKey() {
 // Accepte les formats: "abc123...", "0xabc123...", avec ou sans espaces
 func parseHashFromHexString(hexInput string) ([32]byte, error) {
 	var hash [32]byte
-
 	// Nettoyer l'entrée
 	cleanedInput := strings.TrimSpace(hexInput)
 	cleanedInput = strings.ReplaceAll(cleanedInput, " ", "")
 	cleanedInput = strings.ReplaceAll(cleanedInput, "\t", "")
-
 	// Supprimer le préfixe "0x" si présent
 	cleanedInput = strings.TrimPrefix(cleanedInput, "0x")
 	cleanedInput = strings.TrimPrefix(cleanedInput, "0X")
-
 	// Convertir en minuscules
 	cleanedInput = strings.ToLower(cleanedInput)
-
 	// Vérifier la longueur (un hash SHA-256 = 64 caractères hex)
 	if len(cleanedInput) < 64 {
 		return hash, fmt.Errorf("⚠️ Hash trop court (%d caractères, attendu 64)", len(cleanedInput))
 	}
-
-	// Prendre les 64 premiers caractères
+	// Prendre les 64 premiers caractères au cas où si on a copier plus (vide ou commentaire etc)
 	cleanedInput = cleanedInput[:64]
-
 	// Décoder l'hexadécimal
 	decodedBytes, err := hex.DecodeString(cleanedInput)
 	if err != nil {
@@ -134,15 +127,13 @@ func parseHashFromHexString(hexInput string) ([32]byte, error) {
 	return hash, nil
 }
 
-// ===========================================================================
 // Handlers des options du menu
-// ===========================================================================
 
 // handleListAvailablePeers affiche tous les peers enregistrés sur le serveur
 func (m *InteractiveMenu) handleListAvailablePeers() {
 	fmt.Println("\n📡 Récupération de la liste des peers...")
-
 	peerList, err := transport.GetListPeers()
+
 	if err != nil {
 		fmt.Printf("⚠️ Impossible de récupérer la liste des peers: %v\n", err)
 		return
@@ -155,9 +146,11 @@ func (m *InteractiveMenu) handleListAvailablePeers() {
 
 	fmt.Printf("\n📋 %d peers disponibles:\n", len(peerList))
 	fmt.Println(strings.Repeat("-", 40))
+
 	for index, peerName := range peerList {
 		fmt.Printf("  %2d. %s\n", index+1, peerName)
 	}
+
 	fmt.Println(strings.Repeat("-", 40))
 	m.waitForEnterKey()
 }
@@ -165,18 +158,17 @@ func (m *InteractiveMenu) handleListAvailablePeers() {
 // handleConnectToPeer établit une connexion avec un peer via NAT traversal
 func (m *InteractiveMenu) handleConnectToPeer() {
 	peerName := m.readUserInput("\nNom du peer: ")
+
 	if peerName == "" {
 		fmt.Println("⚠️ Nom de peer vide")
 		return
 	}
-
 	// Récupérer les adresses du peer depuis le serveur HTTP
 	addressesRaw, err := transport.GetAddr(peerName)
 	if err != nil {
 		fmt.Printf("⚠️ Impossible de récupérer les adresses de %s: %v\n", peerName, err)
 		return
 	}
-
 	// Parser et résoudre les adresses
 	var peerAddresses []*net.UDPAddr
 	for addrLine := range strings.SplitSeq(strings.TrimSpace(addressesRaw), "\n") {
@@ -200,7 +192,6 @@ func (m *InteractiveMenu) handleConnectToPeer() {
 		m.waitForEnterKey()
 		return
 	}
-
 	fmt.Println("\n🔗 Connexion en cours...")
 
 	// Phase 1: Tentatives de connexion directe
@@ -257,6 +248,7 @@ func (m *InteractiveMenu) sendNatTraversalRequests(targetAddresses []*net.UDPAdd
 // getSelectedPeerInfo demande à l'utilisateur de sélectionner un peer connecté
 func (m *InteractiveMenu) getSelectedPeerInfo() (*peer.PeerInfo, string) {
 	connectedPeers := m.server.PeerManager.List()
+
 	if len(connectedPeers) == 0 {
 		fmt.Println("⚠️ Aucun peer connecté. Utilisez l'option 2 d'abord.")
 		return nil, ""
@@ -301,9 +293,10 @@ func (m *InteractiveMenu) getRootHashFromPeer(peerInfo *peer.PeerInfo, selectedP
 	case tmpHash := <-m.rootHashChan:
 		fmt.Println("✅ Réception du hash racine réussie")
 		targetHash = tmpHash
-	case <-time.After(3 * time.Second):
+	case <-time.After(protocol.Timeout * time.Second):
 		fmt.Println("⏳ Timeout: pas de réponse reçue (3s)")
 	}
+
 	m.server.SetRootHashChan(nil)
 	return targetHash
 }
@@ -339,7 +332,7 @@ func (m *InteractiveMenu) handleExplorePeerFiles() {
 	m.waitForEnterKey()
 }
 
-// handleDownloadFiles télécharge les fichiers d'un peer sur le disque
+// handleDownloadFiles parse le hash et lance le téléchargement sur le disque
 func (m *InteractiveMenu) handleDownloadFiles() {
 	peerInfo, selectedPeerName := m.getSelectedPeerInfo()
 	if peerInfo == nil {
@@ -348,6 +341,7 @@ func (m *InteractiveMenu) handleDownloadFiles() {
 
 	// Demander le hash à télécharger
 	hashInput := m.readUserInput("Hash du datum (hex, ou 'root' pour la racine): ")
+	fmt.Println()
 
 	var targetHash [32]byte
 	if hashInput == "root" {
@@ -363,9 +357,9 @@ func (m *InteractiveMenu) handleDownloadFiles() {
 		}
 		targetHash = parsedHash
 	}
-
 	// Télécharger sur le disque
 	m.downloadFilesToDisk(selectedPeerName, peerInfo.Addr, targetHash)
+
 	m.waitForEnterKey()
 }
 
@@ -411,9 +405,10 @@ func (m *InteractiveMenu) handleShowConnectedPeers() {
 			info, _ := m.server.PeerManager.Get(name)
 			fmt.Printf("  • %s\n", name)
 			fmt.Printf("    Adresse: %s\n", info.Addr)
-			fmt.Printf("    Dernière activité: %s\n", info.LastSeen.Format("15:04:05"))
+			fmt.Printf("    Dernière activité: %s\n", info.LastActivity.Format("15:04:05"))
 		}
 	}
+
 	fmt.Println(strings.Repeat("-", 50))
 	m.waitForEnterKey()
 }
@@ -436,8 +431,8 @@ func (m *InteractiveMenu) handleShowSharedFiles() {
 
 	fmt.Println("\n  Arborescence:")
 	m.displayLocalFileTree(m.server.RootHash, "  ", "", true)
-
 	fmt.Println(strings.Repeat("─", 70))
+
 	m.waitForEnterKey()
 }
 
@@ -476,17 +471,14 @@ func (m *InteractiveMenu) handleShowDownloadsFolder() {
 		peerDirPath := filepath.Join("downloads", entry.Name())
 		fileCount, totalSize := countFilesInDirectory(peerDirPath)
 		fmt.Printf("  📁 %s\n", entry.Name())
-		fmt.Printf("     └── %d fichier(s), %s\n", fileCount, formatBytesInt64(totalSize))
+		fmt.Printf("     └── %d fichier(s), %s\n", fileCount, utils.FormatBytesInt64(totalSize))
 	}
 
 	fmt.Println(strings.Repeat("─", 70))
 	fmt.Println("\n📍 Emplacement: ./downloads/")
+
 	m.waitForEnterKey()
 }
-
-// ===========================================================================
-// Fonctions utilitaires d'affichage
-// ===========================================================================
 
 // displayFileTree affiche l'arborescence des fichiers téléchargés
 func (m *InteractiveMenu) displayFileTree(hash [32]byte, prefix string, fileName string, isLastChild bool) {
@@ -536,39 +528,29 @@ func (m *InteractiveMenu) displayFileTree(hash [32]byte, prefix string, fileName
 			entryName := merkle.GetEntryName(entry)
 			m.displayFileTree(entry.Hash, childPrefix, entryName, i == len(entries)-1)
 		}
-
 	case merkle.TypeBigDirectory:
 		childHashes := merkle.ParseBigHashes(nodeData)
 		if fileName != "" {
-			fmt.Printf("%s%s📁 %s/ [BigDir, %d parties] %x\n", prefix, connector, fileName, len(childHashes), hash)
+			fmt.Printf("%s%s📁 %s/ [BigDir, %d enfants] %x\n", prefix, connector, fileName, len(childHashes), hash)
 		} else {
-			fmt.Printf("%s📁 / [BigDir, %d parties] %x\n", prefix, len(childHashes), hash)
+			fmt.Printf("%s📁 / [BigDir, %d enfants] %x\n", prefix, len(childHashes), hash)
 		}
 		for i, childHash := range childHashes {
 			m.displayFileTree(childHash, childPrefix, "", i == len(childHashes)-1)
 		}
-
 	case merkle.TypeChunk:
-		sizeStr := formatBytes(len(nodeData))
-		textPreview := ""
-		if len(nodeData) > 0 && isTextData(nodeData[:minInt(len(nodeData), 30)]) {
-			textPreview = fmt.Sprintf(" \"%s\"", string(nodeData[:minInt(len(nodeData), 30)]))
-			if len(nodeData) > 30 {
-				textPreview = textPreview[:len(textPreview)-1] + "...\""
-			}
-		}
+		sizeStr := utils.FormatBytes(len(nodeData))
 		if fileName != "" {
-			fmt.Printf("%s%s📄 %s [Chunk, %s]%s %x\n", prefix, connector, fileName, sizeStr, textPreview, hash)
+			fmt.Printf("%s%s📄 %s [Chunk, %s] %x\n", prefix, connector, fileName, sizeStr, hash)
 		} else {
-			fmt.Printf("%s%s📄 [Chunk, %s]%s %x\n", prefix, connector, sizeStr, textPreview, hash)
+			fmt.Printf("%s%s📄 [Chunk, %s] %x\n", prefix, connector, sizeStr, hash)
 		}
-
 	case merkle.TypeBig:
 		childHashes := merkle.ParseBigHashes(nodeData)
 		totalSize := m.calculateBigFileSize(hash)
 		sizeStr := "?"
 		if totalSize > 0 {
-			sizeStr = formatBytes(totalSize)
+			sizeStr = utils.FormatBytes(totalSize)
 		}
 		if fileName != "" {
 			fmt.Printf("%s%s📄 %s [Big, %s, %d parties] %x\n", prefix, connector, fileName, sizeStr, len(childHashes), hash)
@@ -591,7 +573,6 @@ func (m *InteractiveMenu) displayLocalFileTree(hash [32]byte, prefix string, fil
 	}
 
 	nodeType, nodeData := merkle.ParseDatum(datum)
-
 	childPrefix := prefix
 	if fileName != "" {
 		if isLastChild {
@@ -605,42 +586,39 @@ func (m *InteractiveMenu) displayLocalFileTree(hash [32]byte, prefix string, fil
 	case merkle.TypeDirectory:
 		entries := merkle.ParseDirectoryEntries(nodeData)
 		if fileName != "" {
-			fmt.Printf("%s%s📁 %s/ [Dir, %d entrées, %x...]\n", prefix, connector, fileName, len(entries), hash[:8])
+			fmt.Printf("%s%s📁 %s/ [Dir, %d entrées] %x\n", prefix, connector, fileName, len(entries), hash)
 		} else {
-			fmt.Printf("%s📁 / [Dir, %d entrées, %x...]\n", prefix, len(entries), hash[:8])
+			fmt.Printf("%s📁 / [Dir, %d entrées] %x\n", prefix, len(entries), hash)
 		}
 		for i, entry := range entries {
 			entryName := merkle.GetEntryName(entry)
 			m.displayLocalFileTree(entry.Hash, childPrefix, entryName, i == len(entries)-1)
 		}
-
 	case merkle.TypeBigDirectory:
 		childHashes := merkle.ParseBigHashes(nodeData)
 		if fileName != "" {
-			fmt.Printf("%s%s📁 %s/ [BigDir, %d parties, %x...]\n", prefix, connector, fileName, len(childHashes), hash[:8])
+			fmt.Printf("%s%s📁 %s/ [BigDir, %d parties] %x\n", prefix, connector, fileName, len(childHashes), hash)
 		} else {
-			fmt.Printf("%s📁 / [BigDir, %d parties, %x...]\n", prefix, len(childHashes), hash[:8])
+			fmt.Printf("%s📁 / [BigDir, %d parties] %x\n", prefix, len(childHashes), hash)
 		}
 		for i, childHash := range childHashes {
 			m.displayLocalFileTree(childHash, childPrefix, "", i == len(childHashes)-1)
 		}
-
 	case merkle.TypeChunk:
-		sizeStr := formatBytes(len(nodeData))
+		sizeStr := utils.FormatBytes(len(nodeData))
 		if fileName != "" {
-			fmt.Printf("%s%s📄 %s [Chunk, %s, %x...]\n", prefix, connector, fileName, sizeStr, hash[:8])
+			fmt.Printf("%s%s📄 %s [Chunk, %s] %x\n", prefix, connector, fileName, sizeStr, hash)
 		} else {
-			fmt.Printf("%s%s📄 [Chunk, %s, %x...]\n", prefix, connector, sizeStr, hash[:8])
+			fmt.Printf("%s%s📄 [Chunk, %s] %x\n", prefix, connector, sizeStr, hash)
 		}
-
 	case merkle.TypeBig:
 		childHashes := merkle.ParseBigHashes(nodeData)
 		totalSize := m.calculateLocalBigFileSize(hash)
-		sizeStr := formatBytes(totalSize)
+		sizeStr := utils.FormatBytes(totalSize)
 		if fileName != "" {
-			fmt.Printf("%s%s📄 %s [Big, %s, %d parties, %x...]\n", prefix, connector, fileName, sizeStr, len(childHashes), hash[:8])
+			fmt.Printf("%s%s📄 %s [Big, %s, %d parties] %x\n", prefix, connector, fileName, sizeStr, len(childHashes), hash)
 		} else {
-			fmt.Printf("%s%s📄 [Big, %s, %d parties, %x...]\n", prefix, connector, sizeStr, len(childHashes), hash[:8])
+			fmt.Printf("%s%s📄 [Big, %s, %d parties] %x\n", prefix, connector, sizeStr, len(childHashes), hash)
 		}
 	}
 }
@@ -651,6 +629,7 @@ func (m *InteractiveMenu) calculateBigFileSize(hash [32]byte) int {
 	if !found {
 		return 0
 	}
+
 	nodeType, nodeData := merkle.ParseDatum(datum)
 
 	switch nodeType {
@@ -676,6 +655,7 @@ func (m *InteractiveMenu) calculateLocalBigFileSize(hash [32]byte) int {
 	if !found {
 		return 0
 	}
+
 	nodeType, nodeData := merkle.ParseDatum(datum)
 
 	switch nodeType {
@@ -691,10 +671,6 @@ func (m *InteractiveMenu) calculateLocalBigFileSize(hash [32]byte) int {
 	return 0
 }
 
-// ===========================================================================
-// Fonctions utilitaires générales
-// ===========================================================================
-
 // countFilesInDirectory compte les fichiers et calcule la taille totale d'un dossier
 func countFilesInDirectory(dirPath string) (int, int64) {
 	var fileCount int
@@ -703,6 +679,7 @@ func countFilesInDirectory(dirPath string) (int, int64) {
 		if err != nil {
 			return nil
 		}
+
 		if !info.IsDir() {
 			fileCount++
 			totalSize += info.Size()
@@ -710,45 +687,4 @@ func countFilesInDirectory(dirPath string) (int, int64) {
 		return nil
 	})
 	return fileCount, totalSize
-}
-
-// formatBytes formate une taille en bytes de façon lisible
-func formatBytes(byteCount int) string {
-	if byteCount < 1024 {
-		return fmt.Sprintf("%d B", byteCount)
-	} else if byteCount < 1024*1024 {
-		return fmt.Sprintf("%.1f KB", float64(byteCount)/1024)
-	}
-	return fmt.Sprintf("%.1f MB", float64(byteCount)/(1024*1024))
-}
-
-// formatBytesInt64 formate une taille int64 en bytes de façon lisible
-func formatBytesInt64(byteCount int64) string {
-	if byteCount < 1024 {
-		return fmt.Sprintf("%d B", byteCount)
-	} else if byteCount < 1024*1024 {
-		return fmt.Sprintf("%.1f KB", float64(byteCount)/1024)
-	}
-	return fmt.Sprintf("%.1f MB", float64(byteCount)/(1024*1024))
-}
-
-// isTextData vérifie si les données sont du texte affichable
-func isTextData(data []byte) bool {
-	for _, b := range data {
-		if b < 32 && b != '\n' && b != '\r' && b != '\t' {
-			return false
-		}
-		if b > 126 {
-			return false
-		}
-	}
-	return true
-}
-
-// minInt retourne le minimum de deux entiers
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
