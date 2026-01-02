@@ -1,8 +1,6 @@
 package transport
 
 import (
-	"bytes"
-	"encoding/binary"
 	"fmt"
 	"main/internal/protocol"
 	"net"
@@ -25,32 +23,15 @@ func ListenLoop(conn *net.UDPConn) {
 }
 
 func handlePacket(conn *net.UDPConn, remoteAddr *net.UDPAddr, data []byte) {
-	if len(data) < 7 {
+	id, msgType, _, body, signature, err := protocol.DecodeMessages(data)
+	if err != nil {
+		fmt.Println("Erreur décodage message:", err)
 		return
 	}
 
-	reader := bytes.NewReader(data[:7])
-	var msg protocol.Messages
-
-	binary.Read(reader, binary.BigEndian, &msg.ID)
-	binary.Read(reader, binary.BigEndian, &msg.Type)
-	binary.Read(reader, binary.BigEndian, &msg.Length)
-
-	if len(data) < 7+int(msg.Length) {
-		fmt.Println("Paquet corrompu (Body incomplet)")
-		return
-	}
-
-	body := data[7 : 7+msg.Length]
-
-	var signature []byte
-	if len(data) >= 7+int(msg.Length)+64 {
-		signature = data[7+int(msg.Length) : 7+int(msg.Length)+64]
-	}
-
-	switch msg.Type {
+	switch msgType {
 	case protocol.Hello:
-		processHello(conn, body, signature, remoteAddr, msg.ID)
+		processHello(conn, body, signature, remoteAddr, id)
 	case protocol.HelloReply:
 		processHelloReply(body, signature, remoteAddr)
 	case protocol.Ping:
@@ -59,7 +40,7 @@ func handlePacket(conn *net.UDPConn, remoteAddr *net.UDPAddr, data []byte) {
 	case protocol.Ok:
 		fmt.Println("Ok reçu")
 	default:
-		fmt.Printf("Message type %d reçu\n", msg.Type)
+		fmt.Printf("Message type %d reçu\n", msgType)
 	}
 }
 
@@ -78,7 +59,7 @@ func processHello(conn *net.UDPConn, body []byte, signature []byte, addr *net.UD
 		fmt.Println("Hello non signé ! (Devrait être rejeté)")
 	} else {
 		fmt.Println("Signature présente.")
-		SendMessage(conn, addr, msgID, protocol.HelloReply)
+		SendHandshake(conn, addr, msgID, protocol.HelloReply)
 	}
 }
 

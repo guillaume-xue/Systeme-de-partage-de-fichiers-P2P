@@ -3,7 +3,6 @@ package transport
 import (
 	"bytes"
 	"crypto/ecdsa"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"main/internal/crypto"
@@ -37,18 +36,18 @@ func GetListPeers() ([]string, error) {
 	return peers, nil
 }
 
-func GetAddr(name string) (string, error) {
+func GetAddr(name string) ([]byte, error) {
 	resp, err := http.Get(protocol.URL + name + "/addresses")
 	if err != nil {
-		return "", fmt.Errorf("failed to get address: %w", err)
+		return nil, fmt.Errorf("failed to get address: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("failed to read response body: %w", err)
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
-	return string(body), nil
+	return body, nil
 }
 
 func GetKey(name string) ([]byte, error) {
@@ -90,42 +89,27 @@ func RegisterHTTP(privateKey *ecdsa.PrivateKey) error {
 	return nil
 }
 
-func SendMessage(conn *net.UDPConn, destAddr *net.UDPAddr, msgID uint32, msgType uint8) error {
-	privKey, _ := crypto.LoadOrGenerateKey(protocol.FILENAME)
+func SendHandshake(conn *net.UDPConn, destAddr *net.UDPAddr, msgID uint32, msgType uint8) error {
 	myName := protocol.MyName
 
-	bodyBuf := new(bytes.Buffer)
-
-	extensions := uint32(0)
-	binary.Write(bodyBuf, binary.BigEndian, extensions)
-
-	bodyBuf.Write([]byte(myName))
-	body := bodyBuf.Bytes()
-
-	msg := protocol.Messages{
-		ID:     msgID,
-		Type:   msgType,
-		Length: uint16(len(body)),
-	}
-
-	headerBuf := new(bytes.Buffer)
-	binary.Write(headerBuf, binary.BigEndian, msg.ID)
-	binary.Write(headerBuf, binary.BigEndian, msg.Type)
-	binary.Write(headerBuf, binary.BigEndian, msg.Length)
-	header := headerBuf.Bytes()
-
-	dataToSign := append(header, body...)
-
-	signature := crypto.ComputeSignature(privKey, dataToSign)
-
-	packet := append(dataToSign, signature...)
+	packet := protocol.EncodeHandshakeMessage(msgID, msgType, 0, []byte(myName))
 
 	_, err := conn.WriteToUDP(packet, destAddr)
 	if err != nil {
 		return fmt.Errorf("erreur envoi Message: %w", err)
 	}
 
-	fmt.Printf("Message envoyé à %s (ID:%d)\n", destAddr, msg.ID)
+	fmt.Printf("Message envoyé à %s (ID:%d)\n", destAddr, msgID)
+	return nil
+}
+
+func SendPing(conn *net.UDPConn, destAddr *net.UDPAddr, msgID uint32) error {
+	packet := protocol.EncodeMessages(msgID, protocol.Ping, []byte{})
+	_, err := conn.WriteToUDP(packet, destAddr)
+	if err != nil {
+		return fmt.Errorf("erreur envoi ping: %w", err)
+	}
+	fmt.Printf("Ping envoyé à %s (ID:%d)\n", destAddr, msgID)
 	return nil
 }
 
@@ -149,7 +133,7 @@ func RegisterClient() {
 	}
 
 	serverAddr, _ := net.ResolveUDPAddr("udp", protocol.ServerUDP)
-	if err := SendMessage(conn, serverAddr, uint32(time.Now().Unix()), protocol.Hello); err != nil {
+	if err := SendHandshake(conn, serverAddr, uint32(time.Now().Unix()), protocol.Hello); err != nil {
 		fmt.Println("Erreur envoi Hello:", err)
 	}
 
