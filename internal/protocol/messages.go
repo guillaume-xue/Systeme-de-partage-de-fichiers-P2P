@@ -88,6 +88,47 @@ func DecodeHandshakeMessage(data []byte) (uint32, uint8, uint16, uint32, []byte,
 	return id, msgType, length, extensions, name, signature, nil
 }
 
+func DecodeRootAndData(data []byte) (uint32, uint8, uint16, []byte, error) {
+	id, msgType, length, hash, _, err := DecodeMessages(data)
+	if err != nil {
+		return 0, 0, 0, nil, err
+	}
+	return id, msgType, length, hash, nil
+}
+
+func DecodeDatum(data []byte) (uint32, uint8, uint16, []byte, []byte, []byte, error) {
+	if len(data) < 4 {
+		return 0, 0, 0, nil, nil, nil, fmt.Errorf("Datum invalide (pas d'extensions)")
+	}
+	id, msgType, length, err := DecodeHeader(data)
+
+	if err != nil {
+		return 0, 0, 0, nil, nil, nil, err
+	}
+
+	var hash []byte
+	var value []byte
+	var signature []byte
+
+	if len(data) < 4+int(length) {
+		return 0, 0, 0, nil, nil, nil, fmt.Errorf("paquet corrompu (Body incomplet)")
+	}
+
+	hash = data[7 : 7+32]
+
+	value = data[7+32 : 7+int(length)]
+
+	if len(data) >= 7+int(length)+64 {
+		signature = data[7+int(length) : 7+int(length)+64]
+	}
+
+	fmt.Printf("Parsed Datum - ID: %d, Type: %d, Length: %d\n", id, msgType, length)
+	fmt.Printf("Hash: %v\n", hash)
+	fmt.Printf("Value: %v\n", value)
+	fmt.Printf("Signature: %v\n\n", signature)
+	return id, msgType, length, hash, value, signature, nil
+}
+
 func EncodeHeader(id uint32, msgType uint8, length uint16) []byte {
 	buf := new(bytes.Buffer)
 
@@ -130,6 +171,25 @@ func EncodeHandshakeMessage(id uint32, msgType uint8, extensions uint32, name []
 	signature := crypto.ComputeSignature(privKey, data)
 
 	message := append(data, signature...)
+
+	return message
+}
+
+func EncodeRootAndData(id uint32, msgType uint8, hash []byte) []byte {
+	bodyBuf := new(bytes.Buffer)
+	bodyBuf.Write(hash)
+
+	body := bodyBuf.Bytes()
+	length := uint16(len(body))
+
+	headerBytes := EncodeHeader(id, msgType, length)
+
+	packetData := append(headerBytes, body...)
+
+	privKey, _ := crypto.LoadOrGenerateKey(FILENAME)
+	signature := crypto.ComputeSignature(privKey, packetData)
+
+	message := append(packetData, signature...)
 
 	return message
 }

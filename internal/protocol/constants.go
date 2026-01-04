@@ -21,8 +21,10 @@ const (
 	NoTraversalRequest  = 4
 	NoTraversalRequest2 = 4
 
-	URL       = "https://jch.irif.fr:8443/peers/"
-	ServerUDP = "[2001:660:3301:9243::51c2:1ee5]:8443"
-	MyName    = "heee1"
-	FILENAME  = "client_key.pem"
+	URL        = "https://jch.irif.fr:8443/peers/"
+	ServerUDP6 = "[2001:660:3301:9243::51c2:1ee5]:8443"
+	ServerUDP4 = "81.194.30.229:8443"
+
+	MyName   = "heeeeey"
+	FILENAME = "client_key.pem"
 )

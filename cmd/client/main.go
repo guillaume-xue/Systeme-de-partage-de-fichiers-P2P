@@ -1,9 +1,7 @@
 package main
 
-import (
-	"main/internal/transport"
-)
+import "main/internal/transport"
 
 func main() {
-	transport.RegisterClient()
+	transport.RunServerUDP()
 }

@@ -89,10 +89,30 @@ func RegisterHTTP(privateKey *ecdsa.PrivateKey) error {
 	return nil
 }
 
-func SendHandshake(conn *net.UDPConn, destAddr *net.UDPAddr, msgID uint32, msgType uint8) error {
-	myName := protocol.MyName
+func SendPacket(conn *net.UDPConn, destAddr *net.UDPAddr, msgID uint32, msgType uint8, data []byte) error {
 
-	packet := protocol.EncodeHandshakeMessage(msgID, msgType, 0, []byte(myName))
+	var packet []byte
+
+	switch msgType {
+	case protocol.Ping:
+		packet = protocol.EncodeMessages(msgID, protocol.Ping, []byte{})
+	case protocol.Ok:
+		packet = protocol.EncodeMessages(msgID, protocol.Ok, []byte{})
+	case protocol.Hello:
+		myName := protocol.MyName
+		packet = protocol.EncodeHandshakeMessage(msgID, protocol.Hello, 0, []byte(myName))
+	case protocol.HelloReply:
+		myName := protocol.MyName
+		packet = protocol.EncodeHandshakeMessage(msgID, protocol.HelloReply, 0, []byte(myName))
+	case protocol.RootRequest:
+		packet = protocol.EncodeRootAndData(msgID, protocol.RootRequest, []byte{})
+	case protocol.RootReply:
+		packet = protocol.EncodeRootAndData(msgID, protocol.RootReply, []byte{})
+	case protocol.DatumRequest:
+		packet = protocol.EncodeRootAndData(msgID, protocol.DatumRequest, data)
+	default:
+		return fmt.Errorf("type de message inconnu: %d", msgType)
+	}
 
 	_, err := conn.WriteToUDP(packet, destAddr)
 	if err != nil {
@@ -103,39 +123,22 @@ func SendHandshake(conn *net.UDPConn, destAddr *net.UDPAddr, msgID uint32, msgTy
 	return nil
 }
 
-func SendPing(conn *net.UDPConn, destAddr *net.UDPAddr, msgID uint32) error {
-	packet := protocol.EncodeMessages(msgID, protocol.Ping, []byte{})
-	_, err := conn.WriteToUDP(packet, destAddr)
-	if err != nil {
-		return fmt.Errorf("erreur envoi ping: %w", err)
-	}
-	fmt.Printf("Ping envoyé à %s (ID:%d)\n", destAddr, msgID)
-	return nil
-}
-
-func RegisterClient() {
+func RegisterClient(conn4 *net.UDPConn, conn6 *net.UDPConn) {
 	privKey, _ := crypto.LoadOrGenerateKey(protocol.FILENAME)
 
-	localAddr, _ := net.ResolveUDPAddr("udp", ":8080")
-
-	conn, err := net.ListenUDP("udp", localAddr)
-	if err != nil {
-		panic(err)
-	}
-	defer conn.Close()
-
 	fmt.Println("Port UDP 8080 ouvert pour écoute et envoi.")
-
-	go ListenLoop(conn)
 
 	if err := RegisterHTTP(privKey); err != nil {
 		fmt.Println("Erreur HTTP:", err)
 	}
 
-	serverAddr, _ := net.ResolveUDPAddr("udp", protocol.ServerUDP)
-	if err := SendHandshake(conn, serverAddr, uint32(time.Now().Unix()), protocol.Hello); err != nil {
+	serverAddr6, _ := net.ResolveUDPAddr("udp", protocol.ServerUDP6)
+	serverAddr4, _ := net.ResolveUDPAddr("udp", protocol.ServerUDP4)
+
+	if err := SendPacket(conn6, serverAddr6, uint32(time.Now().Unix()), protocol.Hello, []byte{}); err != nil {
 		fmt.Println("Erreur envoi Hello:", err)
 	}
-
-	select {}
+	if err := SendPacket(conn4, serverAddr4, uint32(time.Now().Unix()), protocol.Hello, []byte{}); err != nil {
+		fmt.Println("Erreur envoi Hello:", err)
+	}
 }
