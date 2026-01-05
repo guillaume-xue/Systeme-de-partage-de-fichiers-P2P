@@ -42,7 +42,7 @@ type Server struct {
 }
 
 func NewServer(conn *net.UDPConn, key *ecdsa.PrivateKey, name string) *Server {
-	s := &Server{
+	return &Server{
 		Conn:            conn,
 		PrivKey:         key,
 		MyName:          name,
@@ -53,12 +53,6 @@ func NewServer(conn *net.UDPConn, key *ecdsa.PrivateKey, name string) *Server {
 		keyCache:        make(map[string][]byte),
 		shutdown:        make(chan struct{}),
 	}
-
-	// Configurer et démarrer l'actualisation automatique des pairs disponibles
-	s.PeerManager.SetFetchFunctions(GetListPeers, GetAddr)
-	s.PeerManager.StartAutoRefresh()
-
-	return s
 }
 
 // ListenLoop : Boucle principale
@@ -90,7 +84,6 @@ func (s *Server) ListenLoop(ctx context.Context) {
 
 // Stop ferme tout
 func (s *Server) Stop() {
-	s.PeerManager.Stop() // Arrêter la goroutine d'actualisation
 	close(s.shutdown)
 	s.Conn.Close()
 }
@@ -297,15 +290,27 @@ func (s *Server) onNatRequest(pkt *protocol.Packet, srcAddr *net.UDPAddr) {
 		return
 	}
 
+	// Vérifier si on connaît la cible (si on est connecté avec elle)
+	targetAddr := targetStruct.ToUDPAddr()
+	targetPeer, targetKnown := s.PeerManager.GetByAddr(targetAddr)
+
+	if !targetKnown {
+		// La cible n'est pas dans nos pairs connectés, on ne peut pas relayer
+		fmt.Printf("⚠️ NAT: %s demande à contacter %s mais cette cible n'est pas connectée à nous\n", srcAddr, targetAddr)
+		SendError(s.Conn, srcAddr, "Cible non connecté", pkt.Header.ID)
+		return
+	}
+
 	// On dit OK à Src
 	SendOk(s.Conn, srcAddr, pkt.Header.ID)
 
-	// On envoie une notif à Target
-	targetAddr := targetStruct.ToUDPAddr()
-	fmt.Printf("🔀 NAT: %s veut contacter %s via nous\n", srcAddr, targetAddr)
+	// On envoie une notif à Target (à toutes ses adresses connues)
+	fmt.Printf("🔀 NAT: %s veut contacter %s via nous\n", srcAddr, targetPeer.Name)
 
-	// Dans le message pour Target, on met l'adresse de Src (pour qu'il sache qui pinguer)
-	SendNatTraversalRequest2(s.Conn, targetAddr, srcAddr, s.PrivKey)
+	// Envoyer NatTraversalRequest2 à toutes les adresses de la cible
+	for _, addr := range targetPeer.Addrs {
+		SendNatTraversalRequest2(s.Conn, addr, srcAddr, s.PrivKey)
+	}
 }
 
 func (s *Server) onNatRequest2(pkt *protocol.Packet, relayAddr *net.UDPAddr) {

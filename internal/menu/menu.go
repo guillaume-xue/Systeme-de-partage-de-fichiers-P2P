@@ -155,8 +155,9 @@ func (m *InteractiveMenu) connectToPeer() {
 		} else {
 			// Utiliser un peer comme relais
 			fmt.Printf("Tentative NAT traversal via peer %s...\n", relayChoice)
-			m.sendNatTraversalViaPeer(targets, relayChoice, pName, responseChan)
-			natPierced = m.pingSpam(targets, pName, 5, responseChan)
+			if hasSucces := m.sendNatTraversalViaPeer(targets, relayChoice); hasSucces {
+				natPierced = m.pingSpam(targets, pName, 5, responseChan)
+			}
 		}
 
 		// Cleanup du canal
@@ -372,12 +373,15 @@ func (m *InteractiveMenu) sendNatTraversalRequests(targetAddresses []*net.UDPAdd
 }
 
 // sendNatTraversalViaPeer utilise un peer comme relais pour le NAT traversal
-func (m *InteractiveMenu) sendNatTraversalViaPeer(targetAddresses []*net.UDPAddr, relayPeerName string, targetPeerName string, responseChan chan *net.UDPAddr) {
+func (m *InteractiveMenu) sendNatTraversalViaPeer(targetAddresses []*net.UDPAddr, relayPeerName string) bool {
+	// Vérifier que le peer relais est connecté
 	relayPeer, exists := m.server.PeerManager.Get(relayPeerName)
 	if !exists {
-		fmt.Printf("❌ Peer relais %s non connecté\n", relayPeerName)
-		return
+		fmt.Printf("❌ Peer relais %s non connecté. Vous devez d'abord être connecté avec ce peer.\n", relayPeerName)
+		return false
 	}
+
+	fmt.Printf("Utilisation de %s comme relais (%d adresse(s))\n", relayPeerName, len(relayPeer.Addrs))
 
 	// Envoyer les requêtes au peer relais
 	for _, targetAddr := range targetAddresses {
@@ -385,6 +389,7 @@ func (m *InteractiveMenu) sendNatTraversalViaPeer(targetAddresses []*net.UDPAddr
 			transport.SendNatTraversalRequest(m.server.Conn, relayAddr, targetAddr, m.server.PrivKey)
 		}
 	}
+	return true
 }
 
 // pingSpam envoie plusieurs pings pour percer le NAT
