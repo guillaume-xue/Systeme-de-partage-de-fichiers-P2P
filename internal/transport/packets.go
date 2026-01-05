@@ -9,203 +9,124 @@ import (
 	"time"
 )
 
-// buildPacket construit un paquet UDP complet avec signature optionnelle
-func buildPacket(id uint32, msgType uint8, body []byte, privKey *ecdsa.PrivateKey) []byte {
-	packet := &protocol.Packet{
+// sendRaw centralise la logique de construction et d'envoi.
+func sendRaw(conn *net.UDPConn, dest *net.UDPAddr, typ uint8, body []byte, key *ecdsa.PrivateKey, replyTo uint32) (uint32, error) {
+	// 1. Gestion ID
+	id := replyTo
+	if id == 0 {
+		// ID aléatoire basé sur le temps (suffisant pour ce projet)
+		id = uint32(time.Now().UnixNano())
+	}
+
+	// 2. Construction Packet
+	pkt := &protocol.Packet{
 		Header: protocol.Header{
 			ID:     id,
-			Type:   msgType,
+			Type:   typ,
 			Length: uint16(len(body)),
 		},
 		Body: body,
 	}
 
-	if privKey != nil {
-		packet.Signature = crypto.ComputeSignature(privKey, packet.DataToSign())
+	// 3. Signature (si une clé est fournie)
+	if key != nil {
+		pkt.Signature = crypto.ComputeSignature(key, pkt.DataToSign())
 	}
 
-	return packet.Encode()
-}
+	// 4. Sérialisation
+	bytes := pkt.Encode()
 
-// generatePacketID génère un ID de paquet unique basé sur l'horodatage
-func generatePacketID() uint32 {
-	return uint32(time.Now().UnixNano() & 0xFFFFFFFF)
-}
-
-// SendHello envoie un message Hello pour initier une association (doit être signé)
-func SendHello(conn *net.UDPConn, destAddr *net.UDPAddr, myName string, privKey *ecdsa.PrivateKey) (uint32, error) {
-	msg := &protocol.HelloMessage{
-		Extensions: 0,
-		Name:       myName,
-	}
-
-	id := generatePacketID()
-	packet := buildPacket(id, protocol.Hello, msg.EncodeBody(), privKey)
-
-	_, err := conn.WriteToUDP(packet, destAddr)
+	// 5. Envoi
+	_, err := conn.WriteToUDP(bytes, dest)
 	if err != nil {
-		return 0, fmt.Errorf("❌ erreur envoi Hello: %w", err)
+		return 0, fmt.Errorf("send error: %v", err)
+	}
+
+	// 6. Log de l'envoi
+	typeName := protocol.GetTypeName(typ)
+	if typ != protocol.DatumRequest {
+		fmt.Printf("📤 Envoi %s → %s (ID: %d)\n", typeName, dest, id)
 	}
 
 	return id, nil
 }
 
-// SendHelloReply envoie une réponse HelloReply (doit être signé)
-func SendHelloReply(conn *net.UDPConn, destAddr *net.UDPAddr, myName string, privKey *ecdsa.PrivateKey, replyToID uint32) error {
-	msg := &protocol.HelloMessage{
-		Extensions: 0,
-		Name:       myName,
-	}
+// --- Messages de Contrôle ---
 
-	packet := buildPacket(replyToID, protocol.HelloReply, msg.EncodeBody(), privKey)
-
-	_, err := conn.WriteToUDP(packet, destAddr)
-	if err != nil {
-		return fmt.Errorf("❌ erreur envoi HelloReply: %w", err)
-	}
-
-	return nil
+func SendPing(conn *net.UDPConn, dest *net.UDPAddr) (uint32, error) {
+	// Ping n'a pas de corps et pas besoin de signature
+	return sendRaw(conn, dest, protocol.Ping, nil, nil, 0)
 }
 
-// SendPing envoie un message Ping pour maintenir l'association (sans signature)
-func SendPing(conn *net.UDPConn, destAddr *net.UDPAddr) (uint32, error) {
-	id := generatePacketID()
-	packet := buildPacket(id, protocol.Ping, []byte{}, nil)
-
-	_, err := conn.WriteToUDP(packet, destAddr)
-	if err != nil {
-		return 0, fmt.Errorf("❌ erreur envoi Ping: %w", err)
-	}
-
-	return id, nil
+func SendOk(conn *net.UDPConn, dest *net.UDPAddr, replyTo uint32) error {
+	_, err := sendRaw(conn, dest, protocol.Ok, nil, nil, replyTo)
+	return err
 }
 
-// SendOk envoie une réponse Ok à un Ping (sans signature)
-func SendOk(conn *net.UDPConn, destAddr *net.UDPAddr, replyToID uint32) error {
-	packet := buildPacket(replyToID, protocol.Ok, []byte{}, nil)
-
-	_, err := conn.WriteToUDP(packet, destAddr)
-	if err != nil {
-		return fmt.Errorf("❌ erreur envoi Ok: %w", err)
-	}
-
-	return nil
+func SendError(conn *net.UDPConn, dest *net.UDPAddr, msg string, replyTo uint32) error {
+	_, err := sendRaw(conn, dest, protocol.Error, []byte(msg), nil, replyTo)
+	return err
 }
 
-// SendRootRequest demande le hash racine du Merkle tree d'un peer
-func SendRootRequest(conn *net.UDPConn, destAddr *net.UDPAddr) (uint32, error) {
-	id := generatePacketID()
-	packet := buildPacket(id, protocol.RootRequest, []byte{}, nil)
+// --- Handshake ---
 
-	_, err := conn.WriteToUDP(packet, destAddr)
-	if err != nil {
-		return 0, fmt.Errorf("❌ erreur envoi RootRequest: %w", err)
-	}
-
-	return id, nil
+func SendHello(conn *net.UDPConn, dest *net.UDPAddr, name string, key *ecdsa.PrivateKey) (uint32, error) {
+	msg := &protocol.HelloMessage{Name: name}
+	// Hello DOIT être signé
+	return sendRaw(conn, dest, protocol.Hello, msg.EncodeBody(), key, 0)
 }
 
-// SendRootReply envoie le hash racine (doit être signé)
-func SendRootReply(conn *net.UDPConn, destAddr *net.UDPAddr, rootHash [32]byte, privKey *ecdsa.PrivateKey, replyToID uint32) error {
-	msg := &protocol.HashMessage{Hash: rootHash}
-
-	packet := buildPacket(replyToID, protocol.RootReply, msg.EncodeBody(), privKey)
-
-	_, err := conn.WriteToUDP(packet, destAddr)
-	if err != nil {
-		return fmt.Errorf("❌ erreur envoi RootReply: %w", err)
-	}
-
-	return nil
+func SendHelloReply(conn *net.UDPConn, dest *net.UDPAddr, name string, key *ecdsa.PrivateKey, replyTo uint32) error {
+	msg := &protocol.HelloMessage{Name: name}
+	_, err := sendRaw(conn, dest, protocol.HelloReply, msg.EncodeBody(), key, replyTo)
+	return err
 }
 
-// SendDatumRequest demande un datum par son hash
-func SendDatumRequest(conn *net.UDPConn, destAddr *net.UDPAddr, hash [32]byte) (uint32, error) {
+// --- Merkle / Data ---
+
+func SendRootRequest(conn *net.UDPConn, dest *net.UDPAddr) (uint32, error) {
+	return sendRaw(conn, dest, protocol.RootRequest, nil, nil, 0)
+}
+
+func SendRootReply(conn *net.UDPConn, dest *net.UDPAddr, hash [32]byte, key *ecdsa.PrivateKey, replyTo uint32) error {
 	msg := &protocol.HashMessage{Hash: hash}
-
-	id := generatePacketID()
-	packet := buildPacket(id, protocol.DatumRequest, msg.EncodeBody(), nil)
-
-	_, err := conn.WriteToUDP(packet, destAddr)
-	if err != nil {
-		return 0, fmt.Errorf("❌ erreur envoi DatumRequest: %w", err)
-	}
-
-	return id, nil
+	// RootReply signé pour prouver que le hash vient bien de nous
+	_, err := sendRaw(conn, dest, protocol.RootReply, msg.EncodeBody(), key, replyTo)
+	return err
 }
 
-// SendDatum envoie un datum (sans signature - protégé par le hash Merkle)
-func SendDatum(conn *net.UDPConn, destAddr *net.UDPAddr, hash [32]byte, value []byte, replyToID uint32) error {
-	msg := &protocol.DatumMessage{Hash: hash, Value: value}
-
-	packet := buildPacket(replyToID, protocol.Datum, msg.EncodeBody(), nil)
-
-	_, err := conn.WriteToUDP(packet, destAddr)
-	if err != nil {
-		return fmt.Errorf("❌ erreur envoi Datum: %w", err)
-	}
-
-	return nil
-}
-
-// SendNoDatum signale qu'on n'a pas le datum demandé (doit être signé)
-func SendNoDatum(conn *net.UDPConn, destAddr *net.UDPAddr, hash [32]byte, privKey *ecdsa.PrivateKey, replyToID uint32) error {
+func SendDatumRequest(conn *net.UDPConn, dest *net.UDPAddr, hash [32]byte) (uint32, error) {
 	msg := &protocol.HashMessage{Hash: hash}
-
-	packet := buildPacket(replyToID, protocol.NoDatum, msg.EncodeBody(), privKey)
-
-	_, err := conn.WriteToUDP(packet, destAddr)
-	if err != nil {
-		return fmt.Errorf("❌ erreur envoi NoDatum: %w", err)
-	}
-
-	return nil
+	return sendRaw(conn, dest, protocol.DatumRequest, msg.EncodeBody(), nil, 0)
 }
 
-// SendError envoie un message d'erreur
-func SendError(conn *net.UDPConn, destAddr *net.UDPAddr, errorMsg string, replyToID uint32) error {
-	packet := buildPacket(replyToID, protocol.Error, []byte(errorMsg), nil)
-
-	_, err := conn.WriteToUDP(packet, destAddr)
-	if err != nil {
-		return fmt.Errorf("❌ erreur envoi Error: %w", err)
-	}
-
-	return nil
+func SendDatum(conn *net.UDPConn, dest *net.UDPAddr, hash [32]byte, data []byte, replyTo uint32) error {
+	// Pas de signature ici, l'intégrité est garantie par le hash Merkle
+	msg := &protocol.DatumMessage{Hash: hash, Value: data}
+	_, err := sendRaw(conn, dest, protocol.Datum, msg.EncodeBody(), nil, replyTo)
+	return err
 }
 
-// SendNatTraversalRequest envoie une demande de NAT traversal à un intermédiaire
-// Le serveur relayera la demande au peer cible (doit être signé)
-func SendNatTraversalRequest(conn *net.UDPConn, relayAddr *net.UDPAddr, targetAddr *net.UDPAddr, privKey *ecdsa.PrivateKey) (uint32, error) {
+func SendNoDatum(conn *net.UDPConn, dest *net.UDPAddr, hash [32]byte, key *ecdsa.PrivateKey, replyTo uint32) error {
+	// Signé pour éviter qu'un attaquant spamme des "NoDatum"
+	msg := &protocol.HashMessage{Hash: hash}
+	_, err := sendRaw(conn, dest, protocol.NoDatum, msg.EncodeBody(), key, replyTo)
+	return err
+}
+
+// --- NAT Traversal ---
+
+func SendNatTraversalRequest(conn *net.UDPConn, relay *net.UDPAddr, target *net.UDPAddr, key *ecdsa.PrivateKey) (uint32, error) {
 	msg := &protocol.NatTraversalMessage{
-		Address: *protocol.FromUDPAddr(targetAddr),
+		Address: *protocol.FromUDPAddr(target),
 	}
-
-	id := generatePacketID()
-	packet := buildPacket(id, protocol.NatTraversalRequest, msg.EncodeBody(), privKey)
-
-	_, err := conn.WriteToUDP(packet, relayAddr)
-	if err != nil {
-		return 0, fmt.Errorf("❌ erreur envoi NatTraversalRequest: %w", err)
-	}
-
-	return id, nil
+	return sendRaw(conn, relay, protocol.NatTraversalRequest, msg.EncodeBody(), key, 0)
 }
 
-// SendNatTraversalRequest2 envoie une demande relay au peer cible (doit être signé)
-// Envoyé par un intermédiaire pour demander au peer de nous envoyer un Ping
-func SendNatTraversalRequest2(conn *net.UDPConn, targetAddr *net.UDPAddr, requesterAddr *net.UDPAddr, privKey *ecdsa.PrivateKey) (uint32, error) {
+func SendNatTraversalRequest2(conn *net.UDPConn, target *net.UDPAddr, requester *net.UDPAddr, key *ecdsa.PrivateKey) (uint32, error) {
 	msg := &protocol.NatTraversalMessage{
-		Address: *protocol.FromUDPAddr(requesterAddr),
+		Address: *protocol.FromUDPAddr(requester),
 	}
-
-	id := generatePacketID()
-	packet := buildPacket(id, protocol.NatTraversalRequest2, msg.EncodeBody(), privKey)
-
-	_, err := conn.WriteToUDP(packet, targetAddr)
-	if err != nil {
-		return 0, fmt.Errorf("❌ erreur envoi NatTraversalRequest2: %w", err)
-	}
-
-	return id, nil
+	// On envoie au target l'instruction de ping l'adresse source
+	return sendRaw(conn, target, protocol.NatTraversalRequest2, msg.EncodeBody(), key, 0)
 }

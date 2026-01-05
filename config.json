@@ -1,0 +1,24 @@
+{
+  "peer": {
+    "name": "heee1",
+    "keyfile": "client_key.pem"
+  },
+  "server": {
+    "url": "https://jch.irif.fr:8443/peers/",
+    "ipv4_address": "81.194.30.229:8443",
+    "ipv6_address": "[2001:660:3301:9243::51c2:1ee5]:8443"
+  },
+  "network": {
+    "timeout_seconds": 3,
+    "keepalive_seconds": 120,
+    "max_window_size": 64,
+    "initial_window": 4,
+    "min_window_size": 1,
+    "timeout_seconds_download": 2
+  },
+  "merkle": {
+    "max_chunk_size": 1024,
+    "max_dir_entries": 16,
+    "max_big_children": 32
+  }
+}

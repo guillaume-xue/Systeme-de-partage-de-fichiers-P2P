@@ -2,6 +2,7 @@ package transport
 
 import (
 	"fmt"
+	"main/internal/config"
 	"main/internal/merkle"
 	"main/internal/utils"
 	"net"
@@ -11,485 +12,433 @@ import (
 	"time"
 )
 
-// DiskDownloader gère et télécharge l'arborescence Merkle directement sur disque
-// Utilise une fenêtre glissante (sliding window) pour optimiser le débit
+// Task : un truc à faire
+type task struct {
+	hash [32]byte
+	path string // vide si c'est juste un morceau intermédiaire
+}
+
+// DiskDownloader : Télécharge direct sur le disque
+// Gère la window size pour ne pas tuer le réseau UDP
 type DiskDownloader struct {
-	server      *Server
-	peerAddress *net.UDPAddr
-	outputDir   string
+	server    *Server
+	peer      *net.UDPAddr
+	outputDir string
 
-	// Paramètres de la fenêtre glissante (congestion control AIMD)
-	windowSize     int           // Taille actuelle de la fenêtre
-	maxWindowSize  int           // Taille maximale de la fenêtre
-	minWindowSize  int           // Taille minimale de la fenêtre
-	requestTimeout time.Duration // Timeout pour une requête
+	// Flow Control
+	window    int
+	maxWindow int
+	minWindow int
+	timeout   time.Duration
 
-	// Gestion des requêtes en cours
-	pendingRequests   map[[32]byte]*diskPendingRequest
-	pendingRequestsMu sync.Mutex
-	responseChannel   chan [32]byte
+	// État
+	inflight  map[[32]byte]time.Time // Hash -> Timestamp d'envoi
+	retries   map[[32]byte]int       // Hash -> Nombre d'essais
+	pendingMu sync.Mutex             // Protège inflight et retries, et window
 
-	// Cache local des datums téléchargés
-	datumCache   map[[32]byte][]byte
-	datumCacheMu sync.RWMutex
+	// Files d'attente
+	workQueue  chan task
+	responseCh chan [32]byte // Signale qu'un hash est arrivé
 
-	// Mapping hash → chemin de fichier
-	hashToPath   map[[32]byte]string
-	hashToPathMu sync.RWMutex
+	// Map pour se souvenir où écrire quoi
+	pathMap   map[[32]byte]string
+	pathMapMu sync.Mutex
 
-	// Fichiers Big à reconstruire après téléchargement
-	bigFilesToReconstruct   map[[32]byte]string
-	bigFilesToReconstructMu sync.Mutex
+	// Reconstruction
+	// On stocke les chemins des fichiers "Big" pour les reconstruire à la fin
+	bigFiles   map[[32]byte]string
+	bigFilesMu sync.Mutex
 
-	// Compteur de traitements en cours
-	activeProcessing   int
-	activeProcessingMu sync.Mutex
+	// Cache temporaire pour les noeuds intermédiaires (BigNodes, Directories)
+	// Les chunks de fichiers, eux, vont direct sur le disque.
+	cache   map[[32]byte][]byte
+	cacheMu sync.RWMutex
 
-	// Statistiques
-	totalSent     int
-	totalReceived int
-	totalTimeouts int
-	filesSaved    int
-	bytesSaved    int64
+	// Stats
+	savedFiles int
+	savedBytes int64
 
-	// File d'attente des téléchargements
-	downloadQueue     []downloadTask
-	downloadQueueMu   sync.Mutex
-	downloadQueueCond *sync.Cond
-
-	// Contrôle d'exécution
-	isRunning bool
-	waitGroup sync.WaitGroup
+	// Lifecycle
+	wg          sync.WaitGroup
+	unsubscribe func()
+	running     bool
 }
 
-// diskPendingRequest représente une requête en attente de réponse
-type diskPendingRequest struct {
-	hash       [32]byte
-	sentAt     time.Time
-	retryCount int
-}
+func NewDiskDownloader(server *Server, peer *net.UDPAddr, output string) *DiskDownloader {
+	return &DiskDownloader{
+		server:    server,
+		peer:      peer,
+		outputDir: output,
 
-// downloadTask représente un datum à télécharger
-type downloadTask struct {
-	hash     [32]byte
-	filePath string
-}
+		// Params fenêtre
+		window:    config.GlobalConfig.Network.InitialWindow,
+		maxWindow: config.GlobalConfig.Network.MaxWindowSize,
+		minWindow: config.GlobalConfig.Network.MinWindowSize,
+		timeout:   config.GlobalConfig.Network.TimeoutDownload,
 
-// NewDiskDownloader crée un nouveau gestionnaire de téléchargement
-func NewDiskDownloader(server *Server, peerAddress *net.UDPAddr, outputDir string) *DiskDownloader {
-	downloader := &DiskDownloader{
-		server:                server,
-		peerAddress:           peerAddress,
-		outputDir:             outputDir,
-		windowSize:            8,
-		maxWindowSize:         64,
-		minWindowSize:         1,
-		requestTimeout:        2 * time.Second,
-		pendingRequests:       make(map[[32]byte]*diskPendingRequest),
-		responseChannel:       make(chan [32]byte, 200),
-		datumCache:            make(map[[32]byte][]byte),
-		hashToPath:            make(map[[32]byte]string),
-		bigFilesToReconstruct: make(map[[32]byte]string),
-		downloadQueue:         make([]downloadTask, 0),
-		isRunning:             true,
-	}
-	downloader.downloadQueueCond = sync.NewCond(&downloader.downloadQueueMu)
-	return downloader
-}
+		inflight: make(map[[32]byte]time.Time),
+		retries:  make(map[[32]byte]int),
 
-// startWorkers démarre les goroutines de travail
-func (d *DiskDownloader) startWorkers() {
-	d.waitGroup.Add(3)
-	go d.requestSenderLoop()
-	go d.responseProcessorLoop()
-	go d.timeoutMonitorLoop()
-}
+		workQueue:  make(chan task, 10000), // Buffer large pour ne pas bloquer (valeur arbitraire)
+		responseCh: make(chan [32]byte, 100),
 
-// stopWorkers arrête les goroutines de travail
-func (d *DiskDownloader) stopWorkers() {
-	d.isRunning = false
-	d.downloadQueueCond.Broadcast()
-	close(d.responseChannel)
-	d.waitGroup.Wait()
-}
+		pathMap:  make(map[[32]byte]string),
+		bigFiles: make(map[[32]byte]string),
+		cache:    make(map[[32]byte][]byte),
 
-// QueueDownload ajoute un hash à la file de téléchargement
-func (d *DiskDownloader) QueueDownload(hash [32]byte, filePath string) {
-	// Enregistrer le chemin de destination si spécifié
-	if filePath != "" {
-		d.hashToPathMu.Lock()
-		d.hashToPath[hash] = filePath
-		d.hashToPathMu.Unlock()
-	}
-
-	// Vérifier si déjà en cache
-	d.datumCacheMu.RLock()
-	_, alreadyCached := d.datumCache[hash]
-	d.datumCacheMu.RUnlock()
-	if alreadyCached {
-		return
-	}
-
-	// Ajouter à la file d'attente
-	d.downloadQueueMu.Lock()
-	d.downloadQueue = append(d.downloadQueue, downloadTask{hash: hash, filePath: filePath})
-	d.downloadQueueMu.Unlock()
-	d.downloadQueueCond.Signal()
-}
-
-// NotifyReceived est appelé quand un datum est reçu du réseau
-func (d *DiskDownloader) NotifyReceived(hash [32]byte, datum []byte) {
-	// Stocker dans le cache
-	d.datumCacheMu.Lock()
-	d.datumCache[hash] = datum
-	d.datumCacheMu.Unlock()
-
-	// Notifier le processeur de réponses
-	select {
-	case d.responseChannel <- hash:
-	case <-time.After(1 * time.Second):
-	}
-}
-
-// WaitForCompletion attend que tous les téléchargements soient terminés
-func (d *DiskDownloader) WaitForCompletion() {
-	for {
-		d.downloadQueueMu.Lock()
-		queueLength := len(d.downloadQueue)
-		d.downloadQueueMu.Unlock()
-
-		d.pendingRequestsMu.Lock()
-		pendingLength := len(d.pendingRequests)
-		d.pendingRequestsMu.Unlock()
-
-		d.activeProcessingMu.Lock()
-		processingCount := d.activeProcessing
-		d.activeProcessingMu.Unlock()
-
-		if queueLength == 0 && pendingLength == 0 && processingCount == 0 {
-			// Double vérification après un court délai
-			time.Sleep(200 * time.Millisecond)
-
-			d.downloadQueueMu.Lock()
-			queueLength = len(d.downloadQueue)
-			d.downloadQueueMu.Unlock()
-			d.pendingRequestsMu.Lock()
-			pendingLength = len(d.pendingRequests)
-			d.pendingRequestsMu.Unlock()
-			d.activeProcessingMu.Lock()
-			processingCount = d.activeProcessing
-			d.activeProcessingMu.Unlock()
-
-			if queueLength == 0 && pendingLength == 0 && processingCount == 0 {
-				break
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
+		running: true,
 	}
 }
 
 // DownloadToDisk télécharge l'arborescence complète et la sauvegarde sur disque
 func (d *DiskDownloader) DownloadToDisk(rootHash [32]byte) error {
-	// Créer le répertoire de destination
+	// 1. Setup dossier
 	if err := os.MkdirAll(d.outputDir, 0755); err != nil {
-		return fmt.Errorf("impossible de créer le répertoire: %w", err)
+		return fmt.Errorf("mkdir fail: %v", err)
 	}
 
-	fmt.Printf("📥 Téléchargement vers %s\n", d.outputDir)
+	// 2. Abonnement aux events UDP
+	// On utilise un ID random pour éviter les collisions si on lance plusieurs DL
+	subID := fmt.Sprintf("dl_%d", time.Now().UnixNano())
+	d.unsubscribe = d.server.DatumDispatcher.Subscribe(subID, d.onDatumReceived)
 
-	// Démarrer les workers
-	d.startWorkers()
+	// 3. Démarrage workers
+	d.wg.Add(3)
+	go d.senderLoop()
+	go d.processorLoop()
+	go d.monitorLoop()
 
-	// Ajouter le hash racine à la file
-	d.QueueDownload(rootHash, d.outputDir)
+	// 4. On lance la machine avec la racine
+	fmt.Printf("📥 Start DL -> %s (Root: %x...)\n", d.outputDir, rootHash[:6])
 
-	// Afficher la progression
-	go d.displayProgress()
+	// On doit d'abord télécharger le datum pour connaître son type
+	// On commence par demander le hash
+	d.workQueue <- task{hash: rootHash, path: "__ROOT__"} // Marker spécial, utile pour différencier root ou autre
 
-	// Attendre la fin des téléchargements
-	d.WaitForCompletion()
+	// 5. Attente
+	d.waitFinish()
 
-	// Reconstruire les fichiers Big
-	d.reconstructBigFiles()
+	// 6. Reconstruction finale (Assemblage des gros fichiers)
+	d.finalizeBigFiles()
 
-	// Arrêter les workers
-	d.stopWorkers()
+	// 7. Cleanup
+	d.stop()
 
-	// Afficher le résumé
-	fmt.Printf("\n✅ Terminé: %d fichiers, %s\n", d.filesSaved, utils.FormatBytesInt64(d.bytesSaved))
-	if d.totalTimeouts > 0 {
-		fmt.Printf("⚠️  %d timeout(s)\n", d.totalTimeouts)
-	}
+	fmt.Printf("\n✅ Fini ! %d fichiers, %s sur le disque.\n", d.savedFiles, utils.FormatBytesInt64(d.savedBytes))
 	return nil
 }
 
-// requestSenderLoop envoie les requêtes DatumRequest
-func (d *DiskDownloader) requestSenderLoop() {
-	defer d.waitGroup.Done()
-
-	for d.isRunning {
-		// Attendre que la fenêtre soit disponible
-		d.pendingRequestsMu.Lock()
-		if len(d.pendingRequests) >= d.windowSize {
-			d.pendingRequestsMu.Unlock()
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-		d.pendingRequestsMu.Unlock()
-
-		// Récupérer la prochaine tâche
-		d.downloadQueueMu.Lock()
-		for len(d.downloadQueue) == 0 && d.isRunning {
-			d.downloadQueueCond.Wait()
-		}
-		if !d.isRunning {
-			d.downloadQueueMu.Unlock()
-			return
-		}
-		task := d.downloadQueue[0]
-		d.downloadQueue = d.downloadQueue[1:]
-		d.downloadQueueMu.Unlock()
-
-		// Vérifier le cache
-		d.datumCacheMu.RLock()
-		_, alreadyCached := d.datumCache[task.hash]
-		d.datumCacheMu.RUnlock()
-		if alreadyCached {
-			continue
-		}
-
-		// Vérifier si déjà en cours
-		d.pendingRequestsMu.Lock()
-		if _, isPending := d.pendingRequests[task.hash]; isPending {
-			d.pendingRequestsMu.Unlock()
-			continue
-		}
-		d.pendingRequests[task.hash] = &diskPendingRequest{hash: task.hash, sentAt: time.Now()}
-		d.pendingRequestsMu.Unlock()
-
-		// Envoyer la requête
-		SendDatumRequest(d.server.Conn, d.peerAddress, task.hash)
-		d.totalSent++
+func (d *DiskDownloader) stop() {
+	d.running = false
+	if d.unsubscribe != nil {
+		d.unsubscribe()
 	}
+
+	close(d.workQueue)
+	close(d.responseCh)
+	d.wg.Wait()
 }
 
-// responseProcessorLoop traite les réponses reçues
-func (d *DiskDownloader) responseProcessorLoop() {
-	defer d.waitGroup.Done()
-
-	for hash := range d.responseChannel {
-		// Marquer comme reçu et ajuster la fenêtre
-		d.pendingRequestsMu.Lock()
-		if req, isPending := d.pendingRequests[hash]; isPending {
-			if time.Since(req.sentAt) < d.requestTimeout/2 {
-				// Réponse rapide → augmenter la fenêtre
-				d.windowSize = utils.MinInt(d.windowSize+1, d.maxWindowSize)
-			}
-			delete(d.pendingRequests, hash)
-			d.totalReceived++
-		}
-		d.pendingRequestsMu.Unlock()
-
-		// Incrémenter le compteur de traitement
-		d.activeProcessingMu.Lock()
-		d.activeProcessing++
-		d.activeProcessingMu.Unlock()
-
-		// Traiter le datum
-		d.datumCacheMu.RLock()
-		datum, found := d.datumCache[hash]
-		d.datumCacheMu.RUnlock()
-		if found {
-			d.processDatum(hash, datum)
-		}
-
-		// Décrémenter le compteur
-		d.activeProcessingMu.Lock()
-		d.activeProcessing--
-		d.activeProcessingMu.Unlock()
-	}
-}
-
-// timeoutMonitorLoop surveille les timeouts et relance les requêtes
-func (d *DiskDownloader) timeoutMonitorLoop() {
-	defer d.waitGroup.Done()
-
-	ticker := time.NewTicker(100 * time.Millisecond)
+// waitFinish boucle tant qu'il y a du boulot
+func (d *DiskDownloader) waitFinish() {
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
-	for d.isRunning {
+	for {
 		<-ticker.C
-		now := time.Now()
-		var hashesToRetry [][32]byte
 
-		d.pendingRequestsMu.Lock()
-		for hash, req := range d.pendingRequests {
-			if now.Sub(req.sentAt) > d.requestTimeout {
-				if req.retryCount < 3 {
-					req.retryCount++
-					req.sentAt = now
-					hashesToRetry = append(hashesToRetry, hash)
+		d.pendingMu.Lock()
+		inflightCount := len(d.inflight)
+		d.pendingMu.Unlock()
+
+		// Si plus rien en cours, plus rien dans la queue, on suppose que c'est fini
+		if inflightCount == 0 && len(d.workQueue) == 0 {
+			// Petite pause de sécurité pour être sûr qu'un process en cours n'ajoute pas un truc
+			time.Sleep(500 * time.Millisecond)
+			if len(d.inflight) == 0 && len(d.workQueue) == 0 {
+				break
+			}
+		}
+	}
+}
+
+// Callback appelé par le Dispatcher UDP
+func (d *DiskDownloader) onDatumReceived(hash [32]byte, data []byte) {
+	// On stocke d'abord en cache
+	d.cacheMu.Lock()
+	d.cache[hash] = data
+	d.cacheMu.Unlock()
+
+	// On signale au processeur
+	// Select non-bloquant pour ne pas freezer le thread réseau UDP si le channel est plein
+	select {
+	case d.responseCh <- hash:
+	default:
+		// Drop signal, le timeout s'en chargera ou le prochain packet
+	}
+}
+
+// WORKER 1 : Envoie les requêtes 
+func (d *DiskDownloader) senderLoop() {
+	defer d.wg.Done()
+
+	for d.running {
+		// Vérif fenêtre
+		d.pendingMu.Lock()
+		canSend := len(d.inflight) < d.window
+		d.pendingMu.Unlock()
+
+		if !canSend {
+			time.Sleep(10 * time.Millisecond) // Petit wait si surcharge
+			continue
+		}
+
+		// Récup prochaine tâche
+		tache, ok := <-d.workQueue
+		if !ok {
+			return
+		} // Channel fermé
+
+		// Check si déjà reçu (cache)
+		d.cacheMu.RLock()
+		_, gotIt := d.cache[tache.hash]
+		d.cacheMu.RUnlock()
+
+		if gotIt {
+			// On le traite direct comme si on venait de le recevoir
+			d.processDatum(tache.hash, tache.path)
+			continue
+		}
+
+		// Check si déjà demandé (inflight)
+		d.pendingMu.Lock()
+		if _, sending := d.inflight[tache.hash]; sending {
+			d.pendingMu.Unlock()
+			continue
+		}
+
+		d.trackPath(tache.hash, tache.path)
+
+		d.inflight[tache.hash] = time.Now()
+		d.pendingMu.Unlock()
+
+		SendDatumRequest(d.server.Conn, d.peer, tache.hash)
+	}
+}
+
+func (d *DiskDownloader) trackPath(hash [32]byte, p string) {
+	if p == "" {
+		return
+	}
+	d.pathMapMu.Lock()
+	d.pathMap[hash] = p
+	d.pathMapMu.Unlock()
+}
+
+func (d *DiskDownloader) getPath(hash [32]byte) string {
+	d.pathMapMu.Lock()
+	defer d.pathMapMu.Unlock()
+	return d.pathMap[hash]
+}
+
+// WORKER 2 : Traite les réponses
+func (d *DiskDownloader) processorLoop() {
+	defer d.wg.Done()
+
+	for hash := range d.responseCh {
+		d.pendingMu.Lock()
+		start, ok := d.inflight[hash]
+		if ok {
+			// Calcul pour ajuster fenêtre
+			if time.Since(start) < d.timeout/2 {
+				if d.window < d.maxWindow {
+					d.window++
+				}
+			}
+			delete(d.inflight, hash)
+			delete(d.retries, hash) // Reset retry count
+		}
+		d.pendingMu.Unlock()
+
+		path := d.getPath(hash) // Récup le path sauvegardé
+		d.processDatum(hash, path)
+	}
+}
+
+// WORKER 3 : Gère les timeouts
+func (d *DiskDownloader) monitorLoop() {
+	defer d.wg.Done()
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+
+	for d.running {
+		<-tick.C
+		now := time.Now()
+
+		d.pendingMu.Lock()
+		for hash, sentAt := range d.inflight {
+			if now.Sub(sentAt) > d.timeout {
+				// Timeout !
+				d.retries[hash]++
+				if d.retries[hash] > 5 {
+					// Trop d'échecs, on abandonne ce chunk
+					fmt.Printf("⚠️ Give up on %x\n", hash)
+					delete(d.inflight, hash)
 				} else {
-					delete(d.pendingRequests, hash)
-					d.totalTimeouts++
+					// Retry
+					d.inflight[hash] = now // Reset timer
+					// Congestion control: on divise la fenêtre par 2
+					d.window = utils.MaxInt(d.window/2, d.minWindow)
+
+					// Renvoi
+					go SendDatumRequest(d.server.Conn, d.peer, hash)
 				}
 			}
 		}
-		d.pendingRequestsMu.Unlock()
-
-		// Relancer les requêtes et réduire la fenêtre (AIMD)
-		for _, hash := range hashesToRetry {
-			SendDatumRequest(d.server.Conn, d.peerAddress, hash)
-			d.totalSent++
-			d.windowSize = utils.MaxInt(d.windowSize/2, d.minWindowSize)
-		}
+		d.pendingMu.Unlock()
 	}
 }
 
-// processDatum traite un datum reçu selon son type
-func (d *DiskDownloader) processDatum(hash [32]byte, datum []byte) {
-	nodeType, nodeData := merkle.ParseDatum(datum)
+// Traitement d'un datum reçu
+func (d *DiskDownloader) processDatum(hash [32]byte, destPath string) {
+	d.cacheMu.RLock()
+	data, exists := d.cache[hash]
+	d.cacheMu.RUnlock()
 
-	d.hashToPathMu.RLock()
-	filePath := d.hashToPath[hash]
-	d.hashToPathMu.RUnlock()
-
-	switch nodeType {
-	case merkle.TypeDirectory:
-		d.processDirectory(filePath, nodeData)
-
-	case merkle.TypeBigDirectory:
-		d.processBigDirectory(filePath, nodeData)
-
-	case merkle.TypeChunk:
-		d.processChunk(hash, filePath, nodeData)
-
-	case merkle.TypeBig:
-		d.processBigFile(hash, filePath, nodeData)
-	}
-}
-
-// processDirectory traite un répertoire
-func (d *DiskDownloader) processDirectory(dirPath string, data []byte) {
-	if dirPath != "" {
-		os.MkdirAll(dirPath, 0755)
-	}
-
-	entries := merkle.ParseDirectoryEntries(data)
-	for _, entry := range entries {
-		childPath := ""
-		if dirPath != "" {
-			childPath = filepath.Join(dirPath, merkle.GetEntryName(entry))
-		}
-		d.QueueDownload(entry.Hash, childPath)
-	}
-}
-
-// processBigDirectory traite un gros répertoire (>16 entrées)
-func (d *DiskDownloader) processBigDirectory(dirPath string, data []byte) {
-	childHashes := merkle.ParseBigHashes(data)
-	for _, childHash := range childHashes {
-		d.QueueDownload(childHash, dirPath)
-	}
-}
-
-// processChunk traite un fichier simple (<= 1024 bytes)
-func (d *DiskDownloader) processChunk(hash [32]byte, filePath string, data []byte) {
-	if filePath != "" {
-		if err := os.WriteFile(filePath, data, 0644); err == nil {
-			d.filesSaved++
-			d.bytesSaved += int64(len(data))
-		}
-	}
-}
-
-// processBigFile traite un gros fichier (> 1024 bytes, fragmenté)
-func (d *DiskDownloader) processBigFile(hash [32]byte, filePath string, data []byte) {
-	// Télécharger tous les morceaux
-	childHashes := merkle.ParseBigHashes(data)
-	for _, childHash := range childHashes {
-		d.QueueDownload(childHash, "") // Pas de chemin pour les morceaux
-	}
-
-	// Marquer pour reconstruction ultérieure
-	if filePath != "" {
-		d.bigFilesToReconstructMu.Lock()
-		d.bigFilesToReconstruct[hash] = filePath
-		d.bigFilesToReconstructMu.Unlock()
-	}
-}
-
-// reconstructBigFiles reconstruit tous les fichiers Big après téléchargement
-func (d *DiskDownloader) reconstructBigFiles() {
-	d.bigFilesToReconstructMu.Lock()
-	filesToReconstruct := make(map[[32]byte]string)
-	for hash, path := range d.bigFilesToReconstruct {
-		filesToReconstruct[hash] = path
-	}
-	d.bigFilesToReconstructMu.Unlock()
-
-	if len(filesToReconstruct) == 0 {
+	if !exists {
 		return
 	}
 
-	fmt.Printf("🔨 Reconstruction de %d fichiers Big...\n", len(filesToReconstruct))
-	for hash, filePath := range filesToReconstruct {
-		content, err := d.reconstructBigFileContent(hash)
-		if err != nil {
-			continue
-		}
-		if err := os.WriteFile(filePath, content, 0644); err == nil {
-			d.filesSaved++
-			d.bytesSaved += int64(len(content))
-		}
-	}
-}
+	typ, content := merkle.ParseDatum(data)
 
-// reconstructBigFileContent reconstruit le contenu d'un fichier Big
-func (d *DiskDownloader) reconstructBigFileContent(hash [32]byte) ([]byte, error) {
-	d.datumCacheMu.RLock()
-	datum, found := d.datumCache[hash]
-	d.datumCacheMu.RUnlock()
-	if !found {
-		return nil, fmt.Errorf("datum non trouvé: %x", hash[:8])
+	// Cas spécial si c'est le hash de départ (marqué __ROOT__), on détermine le chemin approprié
+	if destPath == "__ROOT__" {
+		// Déterminer le nom de fichier/dossier selon le type
+		if typ == merkle.TypeDirectory || typ == merkle.TypeBigDirectory {
+			// C'est un dossier, on crée un sous-dossier avec le hash comme nom
+			// L'arborescence interne gardera les noms corrects car ils sont dans les Directory entries
+			destPath = filepath.Join(d.outputDir, fmt.Sprintf("dir_%x", hash))
+		} else {
+			// C'est un fichier, on crée un nom de fichier avec le hash
+			destPath = filepath.Join(d.outputDir, fmt.Sprintf("file_%x", hash))
+		}
+		fmt.Printf("📝 Type détecté: %d, destination: %s\n", typ, destPath)
 	}
 
-	nodeType, nodeData := merkle.ParseDatum(datum)
-	switch nodeType {
+	switch typ {
+	case merkle.TypeDirectory:
+		if destPath != "" {
+			os.MkdirAll(destPath, 0755)
+		}
+		entries := merkle.ParseDirectoryEntries(content)
+		for _, e := range entries {
+			// Calcul du chemin enfant
+			childPath := ""
+			if destPath != "" {
+				childPath = filepath.Join(destPath, merkle.GetEntryName(e))
+			}
+			// On ajoute à la file
+			d.workQueue <- task{hash: e.Hash, path: childPath}
+		}
+
+	case merkle.TypeBigDirectory:
+		// Un gros dossier, c'est juste une liste de hashs qui pointent vers des Directory partiels
+		hashes := merkle.ParseBigHashes(content)
+		for _, hash := range hashes {
+			// On propage le même path (c'est le même dossier, juste fragmenté)
+			d.workQueue <- task{hash: hash, path: destPath}
+		}
+
 	case merkle.TypeChunk:
-		return nodeData, nil
+		if destPath != "" {
+			fmt.Printf("💾 Sauvegarde chunk -> %s (%d bytes)\n", destPath, len(content))
+			err := os.WriteFile(destPath, content, 0644)
+			if err == nil {
+				d.savedFiles++
+				d.savedBytes += int64(len(content))
+			} else {
+				fmt.Printf("❌ Erreur écriture: %v\n", err)
+			}
+		}
 
 	case merkle.TypeBig:
-		var content []byte
-		for _, childHash := range merkle.ParseBigHashes(nodeData) {
-			childContent, err := d.reconstructBigFileContent(childHash)
-			if err != nil {
-				return nil, err
-			}
-			content = append(content, childContent...)
+		// Fichier fragmenté. On ne peut pas écrire les bouts en vrac car on ne connait pas l'ordre
+		// sans parser tout l'arbre.
+		// On télécharge tout en cache, et on note qu'il faudra le reconstruire à la fin.
+
+		// 1. On note le hash et le path pour plus tard
+		if destPath != "" {
+			fmt.Printf("📦 Fichier fragmenté détecté: %s\n", destPath)
+			d.bigFilesMu.Lock()
+			d.bigFiles[hash] = destPath
+			d.bigFilesMu.Unlock()
 		}
-		return content, nil
+
+		// 2. On demande les enfants (sans path, car ce sont des bouts bruts)
+		hashes := merkle.ParseBigHashes(content)
+		for _, hash := range hashes {
+			d.workQueue <- task{hash: hash, path: ""}
+		}
 	}
-	return nil, fmt.Errorf("type de datum non supporté: %d", nodeType)
 }
 
-// displayProgress affiche la progression du téléchargement
-func (d *DiskDownloader) displayProgress() {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
+// Reconstruction finale des fichiers Type Big File
+func (d *DiskDownloader) finalizeBigFiles() {
+	d.bigFilesMu.Lock()
+	defer d.bigFilesMu.Unlock()
 
-	for d.isRunning {
-		<-ticker.C
-
-		d.datumCacheMu.RLock()
-		cachedCount := len(d.datumCache)
-		d.datumCacheMu.RUnlock()
-
-		d.pendingRequestsMu.Lock()
-		pendingCount := len(d.pendingRequests)
-		d.pendingRequestsMu.Unlock()
-
-		fmt.Printf("\r📊 Datums: %d | Fichiers: %d | En attente: %d   ",
-			cachedCount, d.filesSaved, pendingCount)
+	if len(d.bigFiles) == 0 {
+		return
 	}
+
+	fmt.Printf("🔨 Reconstruction de %d gros fichiers...\n", len(d.bigFiles))
+
+	for hash, path := range d.bigFiles {
+		fmt.Printf("📦 Reconstruction %s...\n", filepath.Base(path))
+		content, ok := d.reconstruct(hash)
+		if ok {
+			err := os.WriteFile(path, content, 0644)
+			if err == nil {
+				d.savedFiles++
+				d.savedBytes += int64(len(content))
+				fmt.Printf("✅ %s (%s)\n", filepath.Base(path), utils.FormatBytesInt64(int64(len(content))))
+			} else {
+				fmt.Printf("❌ Erreur écriture %s: %v\n", filepath.Base(path), err)
+			}
+		} else {
+			fmt.Printf("❌ Echec reconstruction %s (données manquantes)\n", filepath.Base(path))
+		}
+	}
+}
+
+// Reconstruction récursive depuis le cache RAM
+func (d *DiskDownloader) reconstruct(hash [32]byte) ([]byte, bool) {
+	d.cacheMu.RLock()
+	data, ok := d.cache[hash]
+	d.cacheMu.RUnlock()
+
+	if !ok {
+		return nil, false
+	}
+
+	typ, content := merkle.ParseDatum(data)
+
+	if typ == merkle.TypeChunk {
+		return content, true
+	}
+
+	if typ == merkle.TypeBig {
+		var full []byte
+		hashes := merkle.ParseBigHashes(content)
+		for _, hash := range hashes {
+			part, ok := d.reconstruct(hash)
+			if !ok {
+				return nil, false
+			}
+			full = append(full, part...)
+		}
+		return full, true
+	}
+
+	return nil, false
 }

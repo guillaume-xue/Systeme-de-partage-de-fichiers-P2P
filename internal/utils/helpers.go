@@ -1,25 +1,12 @@
-// Package utils contient les fonctions utilitaires partagées dans tout le projet
 package utils
 
 import (
+	"encoding/hex"
 	"fmt"
+	"strings"
 )
 
-// ===========================================================================
-// Formatage des tailles
-// ===========================================================================
-
-// FormatBytes formate une taille en bytes de façon lisible (int)
-func FormatBytes(byteCount int) string {
-	if byteCount < 1024 {
-		return fmt.Sprintf("%d B", byteCount)
-	} else if byteCount < 1024*1024 {
-		return fmt.Sprintf("%.1f KB", float64(byteCount)/1024)
-	}
-	return fmt.Sprintf("%.1f MB", float64(byteCount)/(1024*1024))
-}
-
-// FormatBytesInt64 formate une taille en bytes de façon lisible (int64)
+// Formate une taille en bytes de façon lisible (int64 au cas où si très gros fichiers)
 func FormatBytesInt64(byteCount int64) string {
 	if byteCount < 1024 {
 		return fmt.Sprintf("%d B", byteCount)
@@ -29,11 +16,6 @@ func FormatBytesInt64(byteCount int64) string {
 	return fmt.Sprintf("%.1f MB", float64(byteCount)/(1024*1024))
 }
 
-// ===========================================================================
-// Fonctions mathématiques
-// ===========================================================================
-
-// MinInt retourne le minimum de deux entiers
 func MinInt(a, b int) int {
 	if a < b {
 		return a
@@ -41,7 +23,6 @@ func MinInt(a, b int) int {
 	return b
 }
 
-// MaxInt retourne le maximum de deux entiers
 func MaxInt(a, b int) int {
 	if a > b {
 		return a
@@ -49,19 +30,29 @@ func MaxInt(a, b int) int {
 	return b
 }
 
-// ===========================================================================
-// Fonctions de texte
-// ===========================================================================
-
-// IsTextData vérifie si les données sont du texte ASCII affichable
-func IsTextData(data []byte) bool {
-	for _, b := range data {
-		if b < 32 && b != '\n' && b != '\r' && b != '\t' {
-			return false
-		}
-		if b > 126 {
-			return false
-		}
+// parseHash convertit une chaîne hexadécimale en hash [32]byte
+// Accepte les formats: "abc123...", "0xabc123...", avec ou sans espaces
+func ParseHash(s string) ([32]byte, error) {
+	s = strings.TrimSpace(s)
+	s = strings.ToLower(s)
+	s = strings.TrimPrefix(s, "0x")
+	if len(s) > 64 {
+		s = s[:64]
 	}
-	return true
+	hash, err := hex.DecodeString(s)
+	if err != nil || len(hash) != 32 {
+		return [32]byte{}, fmt.Errorf("❌ Hash invalide")
+	}
+	var h [32]byte
+	copy(h[:], hash)
+	return h, nil
+}
+
+func CleanName(pName string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			return r
+		}
+		return '_'
+	}, pName)
 }

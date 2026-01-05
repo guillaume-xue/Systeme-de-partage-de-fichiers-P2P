@@ -2,341 +2,283 @@ package transport
 
 import (
 	"fmt"
+	"main/internal/config"
 	"main/internal/merkle"
+	"main/internal/utils"
 	"net"
 	"sync"
 	"time"
 )
 
-// Downloader gère les téléchargements avec fenêtre glissante et contrôle de congestion
+// Downloader : Gère le téléchargement "en mémoire" (pour explorer l'arbre)
+// Contrairement au DiskDownloader, on ne stocke pas les fichiers sur le disque,
+// on remplit juste le store "server.Downloads".
 type Downloader struct {
 	server   *Server
 	peerAddr *net.UDPAddr
 
-	// Fenêtre glissante
-	windowSize    int           // Taille actuelle de la fenêtre
-	maxWindowSize int           // Taille max de la fenêtre
-	minWindowSize int           // Taille min de la fenêtre
-	timeout       time.Duration // Timeout pour les requêtes
+	// Gestion de fenêtre
+	windowSize    int
+	maxWindowSize int
+	minWindowSize int
+	timeout       time.Duration
 
-	// Requêtes en cours
-	pending    map[[32]byte]*pendingRequest
-	pendingMu  sync.Mutex
-	responseCh chan [32]byte // Canal pour signaler les réponses reçues
+	// État des requêtes
+	pending map[[32]byte]time.Time // Hash -> Heure d'envoi
+	retries map[[32]byte]int
+	mu      sync.Mutex
 
-	// Statistiques
-	sent      int
-	received  int
-	timeouts  int
-	duplicate int
-
-	// File d'attente des hash à télécharger
-	queue     [][32]byte
-	queueMu   sync.Mutex
-	queueCond *sync.Cond
+	// Communication interne
+	workCh     chan [32]byte // File d'attente des hash à demander
+	responseCh chan [32]byte // Signal de réception
 
 	// Contrôle
-	running bool
-	wg      sync.WaitGroup
+	running     bool
+	wg          sync.WaitGroup
+	unsubscribe func() // Closure de nettoyage du dispatcher
 }
 
-type pendingRequest struct {
-	hash     [32]byte
-	sentAt   time.Time
-	retries  int
-	maxRetry int
-}
-
-// NewDownloader crée un nouveau gestionnaire de téléchargement
 func NewDownloader(server *Server, peerAddr *net.UDPAddr) *Downloader {
-	d := &Downloader{
-		server:        server,
-		peerAddr:      peerAddr,
-		windowSize:    4,  // Fenêtre initiale
-		maxWindowSize: 32, // Max 32 requêtes en parallèle
-		minWindowSize: 1,  // Min 1 requête
-		timeout:       2 * time.Second,
-		pending:       make(map[[32]byte]*pendingRequest),
-		responseCh:    make(chan [32]byte, 100),
-		queue:         make([][32]byte, 0),
-		running:       true,
+	return &Downloader{
+		server:   server,
+		peerAddr: peerAddr,
+
+		windowSize:    config.GlobalConfig.Network.InitialWindow,
+		maxWindowSize: config.GlobalConfig.Network.MaxWindowSize,
+		minWindowSize: config.GlobalConfig.Network.MinWindowSize,
+		timeout:       config.GlobalConfig.Network.TimeoutDownload,
+
+		pending: make(map[[32]byte]time.Time),
+		retries: make(map[[32]byte]int),
+
+		// Buffer large pour ne pas bloquer l'exploration récursive
+		workCh:     make(chan [32]byte, 10000),
+		responseCh: make(chan [32]byte, 100),
+
+		running: true,
 	}
-	d.queueCond = sync.NewCond(&d.queueMu)
-	return d
 }
 
-// Start démarre le downloader
+// Start lance les workers
 func (d *Downloader) Start() {
-	// Goroutine pour surveiller les réponses
-	d.wg.Add(1)
-	go d.responseWatcher()
+	// On s'abonne avec un nom bidon pour le debug
+	d.unsubscribe = d.server.DatumDispatcher.Subscribe("tree_walker", d.onDatumReceived)
 
-	// Goroutine pour le timeout et retransmission
-	d.wg.Add(1)
-	go d.timeoutWatcher()
-
-	// Goroutine pour envoyer les requêtes
-	d.wg.Add(1)
-	go d.sender()
+	d.wg.Add(3)
+	go d.senderLoop()
+	go d.responseLoop()
+	go d.timeoutLoop()
 }
 
-// Stop arrête le downloader
+// Stop nettoie tout
 func (d *Downloader) Stop() {
 	d.running = false
-	d.queueCond.Broadcast()
+
+	if d.unsubscribe != nil {
+		d.unsubscribe()
+	}
+
+	// On ferme les channels pour arrêter les workers proprement
+	close(d.workCh)
 	close(d.responseCh)
+
 	d.wg.Wait()
 }
 
-// QueueHash ajoute un hash à la file d'attente
-func (d *Downloader) QueueHash(hash [32]byte) {
-	// Vérifier si on l'a déjà
-	if _, ok := d.server.Downloads.Get(hash); ok {
-		return
-	}
+// DownloadTree est la méthode bloquante appelée par le Menu
+func (d *Downloader) DownloadTree(rootHash [32]byte) {
+	fmt.Printf("🌳 Exploration de l'arbre %x...\n", rootHash)
 
-	d.queueMu.Lock()
-	d.queue = append(d.queue, hash)
-	d.queueMu.Unlock()
-	d.queueCond.Signal()
-}
+	d.Start()
 
-// QueueHashes ajoute plusieurs hash à la file d'attente
-func (d *Downloader) QueueHashes(hashes [][32]byte) {
-	d.queueMu.Lock()
-	for _, hash := range hashes {
-		// Vérifier si on l'a déjà
-		if _, ok := d.server.Downloads.Get(hash); !ok {
-			d.queue = append(d.queue, hash)
+	// On injecte la racine
+	d.workCh <- rootHash
+
+	// Boucle d'attente active ("Surcharge wait" avec sleep)
+	// Tant qu'il y a des trucs en cours ou dans la file, on attend.
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		<-ticker.C
+
+		d.mu.Lock()
+		inflight := len(d.pending)
+		d.mu.Unlock()
+
+		queued := len(d.workCh)
+
+		if inflight == 0 && queued == 0 {
+			// Petite sécurité supplémentaire
+			time.Sleep(100 * time.Millisecond)
+			if len(d.pending) == 0 && len(d.workCh) == 0 {
+				break
+			}
 		}
+
+		// Debug visuel optionnel
+		// fmt.Printf("\rWaiting... Pending: %d | Queue: %d", inflight, queued)
 	}
-	d.queueMu.Unlock()
-	d.queueCond.Broadcast()
+
+	d.Stop()
+	fmt.Println("\n✅ Exploration terminée.")
 }
 
-// NotifyReceived est appelé quand un datum est reçu
-func (d *Downloader) NotifyReceived(hash [32]byte, _ []byte) {
+// Callback du dispatcher
+func (d *Downloader) onDatumReceived(hash [32]byte, _ []byte) {
+	// On envoie juste le signal, le worker traitera
 	select {
 	case d.responseCh <- hash:
 	default:
-		// Canal plein, ignorer
+		// Si channel plein, c'est pas grave, le timeout gérera ou le prochain paquet
 	}
 }
 
-// WaitComplete attend que tous les téléchargements soient terminés
-func (d *Downloader) WaitComplete() {
-	for {
-		d.queueMu.Lock()
-		queueEmpty := len(d.queue) == 0
-		d.queueMu.Unlock()
-
-		d.pendingMu.Lock()
-		pendingEmpty := len(d.pending) == 0
-		d.pendingMu.Unlock()
-
-		if queueEmpty && pendingEmpty {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-// GetStats retourne les statistiques
-func (d *Downloader) GetStats() (sent, received, timeouts, duplicate int) {
-	return d.sent, d.received, d.timeouts, d.duplicate
-}
-
-// sender envoie les requêtes depuis la queue
-func (d *Downloader) sender() {
+// Worker 1 : Envoie les demandes
+func (d *Downloader) senderLoop() {
 	defer d.wg.Done()
 
 	for d.running {
-		// Attendre qu'il y ait de la place dans la fenêtre et des hash à envoyer
-		d.pendingMu.Lock()
-		currentPending := len(d.pending)
-		d.pendingMu.Unlock()
+		// 1. Check Window
+		d.mu.Lock()
+		canSend := len(d.pending) < d.windowSize
+		d.mu.Unlock()
 
-		if currentPending >= d.windowSize {
+		if !canSend {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 
-		// Prendre un hash de la queue
-		d.queueMu.Lock()
-		for len(d.queue) == 0 && d.running {
-			d.queueCond.Wait()
-		}
-		if !d.running {
-			d.queueMu.Unlock()
+		// 2. Get Job
+		hash, ok := <-d.workCh
+		if !ok {
 			return
 		}
 
-		hash := d.queue[0]
-		d.queue = d.queue[1:]
-		d.queueMu.Unlock()
-
-		// Vérifier si on l'a déjà
-		if _, ok := d.server.Downloads.Get(hash); ok {
-			d.duplicate++
+		// 3. Check si on l'a déjà 
+		if _, exists := d.server.Downloads.Get(hash); exists {
+			// On l'a déjà, mais il faut peut-être explorer ses enfants !
+			// On relance l'analyse des enfants pour être sûr d'avoir tout l'arbre.
+			datum, _ := d.server.Downloads.Get(hash)
+			d.processChildren(datum)
 			continue
 		}
 
-		// Vérifier si déjà en attente
-		d.pendingMu.Lock()
-		if _, ok := d.pending[hash]; ok {
-			d.pendingMu.Unlock()
+		// 4. Check si déjà en cours
+		d.mu.Lock()
+		if _, inflight := d.pending[hash]; inflight {
+			d.mu.Unlock()
 			continue
 		}
 
-		// Ajouter aux requêtes en attente
-		d.pending[hash] = &pendingRequest{
-			hash:     hash,
-			sentAt:   time.Now(),
-			retries:  0,
-			maxRetry: 3,
-		}
-		d.pendingMu.Unlock()
+		d.pending[hash] = time.Now()
+		d.mu.Unlock()
 
-		// Envoyer la requête
+		// 5. Send
 		SendDatumRequest(d.server.Conn, d.peerAddr, hash)
-		d.sent++
 	}
 }
 
-// responseWatcher surveille les réponses
-func (d *Downloader) responseWatcher() {
+// Worker 2 : Traite les réceptions
+func (d *Downloader) responseLoop() {
 	defer d.wg.Done()
 
 	for hash := range d.responseCh {
-		d.pendingMu.Lock()
-		req, ok := d.pending[hash]
+		d.mu.Lock()
+		sentAt, ok := d.pending[hash]
 		if ok {
-			// Calculer le RTT pour ajuster le timeout
-			rtt := time.Since(req.sentAt)
-			if rtt < d.timeout/2 {
-				// Réponse rapide, augmenter la fenêtre
-				d.increaseWindow()
+			// Calcul pour ajuster fenêtre
+			if time.Since(sentAt) < d.timeout/2 {
+				if d.windowSize < d.maxWindowSize {
+					d.windowSize++
+				}
 			}
-
 			delete(d.pending, hash)
-			d.received++
+			delete(d.retries, hash)
 		}
-		d.pendingMu.Unlock()
+		d.mu.Unlock()
 
-		// Traiter le datum reçu pour ajouter les enfants à la queue
+		// Si on a reçu le datum, il faut aller chercher ses enfants
+		// (Récursion pour tout télécharger)
 		if datum, ok := d.server.Downloads.Get(hash); ok {
 			d.processChildren(datum)
 		}
 	}
 }
 
-// timeoutWatcher gère les timeouts et retransmissions
-func (d *Downloader) timeoutWatcher() {
+// Worker 3 : Gère les timeouts et retransmissions
+func (d *Downloader) timeoutLoop() {
 	defer d.wg.Done()
 
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
 
 	for d.running {
-		<-ticker.C
+		<-tick.C
 
 		now := time.Now()
-		var toRetry [][32]byte
-		var toRemove [][32]byte
+		var retryList [][32]byte
 
-		d.pendingMu.Lock()
-		for hash, req := range d.pending {
-			if now.Sub(req.sentAt) > d.timeout {
-				if req.retries < req.maxRetry {
-					req.retries++
-					req.sentAt = now
-					toRetry = append(toRetry, hash)
+		d.mu.Lock()
+		for h, t := range d.pending {
+			if now.Sub(t) > d.timeout {
+				d.retries[h]++
+				if d.retries[h] > 3 {
+					// Trop d'essais, on lâche l'affaire pour ce noeud
+					fmt.Printf("⚠️ Timeout définitif sur %x\n", h)
+					delete(d.pending, h)
 				} else {
-					toRemove = append(toRemove, hash)
-					d.timeouts++
+					retryList = append(retryList, h)
+					d.pending[h] = now // Reset timer
 				}
 			}
 		}
 
-		// Supprimer les requêtes qui ont trop de retries
-		for _, hash := range toRemove {
-			delete(d.pending, hash)
+		// Si on a des timeouts, on réduit la fenêtre (Congestion)
+		if len(retryList) > 0 {
+			d.windowSize = utils.MaxInt(d.windowSize/2, d.minWindowSize)
 		}
-		d.pendingMu.Unlock()
+		d.mu.Unlock()
 
-		// Retransmettre
-		for _, hash := range toRetry {
-			SendDatumRequest(d.server.Conn, d.peerAddr, hash)
-			d.sent++
-			// Réduire la fenêtre (congestion)
-			d.decreaseWindow()
+		// Retransmission
+		for _, h := range retryList {
+			SendDatumRequest(d.server.Conn, d.peerAddr, h)
 		}
 	}
 }
 
-// processChildren ajoute les hash enfants à la queue
+// Analyse le contenu pour trouver les enfants à télécharger
 func (d *Downloader) processChildren(datum []byte) {
-	nodeType, data := merkle.ParseDatum(datum)
+	typ, content := merkle.ParseDatum(datum)
 
-	switch nodeType {
+	switch typ {
 	case merkle.TypeDirectory:
-		entries := merkle.ParseDirectoryEntries(data)
-		hashes := make([][32]byte, len(entries))
-		for i, entry := range entries {
-			hashes[i] = entry.Hash
+		entries := merkle.ParseDirectoryEntries(content)
+		for _, e := range entries {
+			d.queueHash(e.Hash)
 		}
-		d.QueueHashes(hashes)
 
-	case merkle.TypeBig, merkle.TypeBigDirectory:
-		hashes := merkle.ParseBigHashes(data)
-		d.QueueHashes(hashes)
+	case merkle.TypeBigDirectory, merkle.TypeBig:
+		// Pour les BigNodes, le contenu c'est juste des hashs
+		hashes := merkle.ParseBigHashes(content)
+		for _, h := range hashes {
+			d.queueHash(h)
+		}
+
+		// TypeChunk : rien à faire, c'est une feuille (bout de fichier)
 	}
 }
 
-// increaseWindow augmente la taille de la fenêtre (additive increase)
-func (d *Downloader) increaseWindow() {
-	if d.windowSize < d.maxWindowSize {
-		d.windowSize++
+// Helper pour ajouter à la file sans bloquer
+func (d *Downloader) queueHash(h [32]byte) {
+	// On vérifie d'abord si on l'a pas déjà (évite de spammer le channel)
+	if _, ok := d.server.Downloads.Get(h); ok {
+		return
 	}
-}
 
-// decreaseWindow réduit la taille de la fenêtre (multiplicative decrease)
-func (d *Downloader) decreaseWindow() {
-	d.windowSize = max(d.windowSize / 2, d.minWindowSize)
-}
-
-// DownloadTree télécharge récursivement un arbre Merkle
-func (d *Downloader) DownloadTree(rootHash [32]byte) {
-	fmt.Printf("🚀 Démarrage du téléchargement (fenêtre: %d)\n", d.windowSize)
-
-	d.Start()
-	d.QueueHash(rootHash)
-
-	// Afficher la progression
-	go func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
-		defer ticker.Stop()
-		for d.running {
-			<-ticker.C
-			d.pendingMu.Lock()
-			pending := len(d.pending)
-			d.pendingMu.Unlock()
-
-			d.queueMu.Lock()
-			queued := len(d.queue)
-			d.queueMu.Unlock()
-
-			downloaded := d.server.Downloads.Len()
-			fmt.Printf("\r📊 Téléchargés: %d | En attente: %d | Queue: %d | Fenêtre: %d   ",
-				downloaded, pending, queued, d.windowSize)
-		}
-	}()
-
-	d.WaitComplete()
-	d.Stop()
-
-	fmt.Printf("\n✅ Téléchargement terminé!\n")
-	sent, received, timeouts, dup := d.GetStats()
-	fmt.Printf("   📈 Stats: %d envoyés, %d reçus, %d timeouts, %d duplicates\n",
-		sent, received, timeouts, dup)
+	select {
+	case d.workCh <- h:
+	default:
+		// fmt.Println("Queue full!")
+	}
 }

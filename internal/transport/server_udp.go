@@ -1,7 +1,9 @@
 package transport
 
 import (
+	"context"
 	"crypto/ecdsa"
+	"crypto/sha256"
 	"fmt"
 	"main/internal/crypto"
 	"main/internal/merkle"
@@ -12,389 +14,446 @@ import (
 	"time"
 )
 
-// Server représente le serveur UDP
 type Server struct {
-	Conn        *net.UDPConn
-	PrivKey     *ecdsa.PrivateKey
-	MyName      string
+	Conn    *net.UDPConn
+	PrivKey *ecdsa.PrivateKey
+	MyName  string
+
+	// Composants internes
 	PeerManager *peer.PeerManager
-	MerkleStore *merkle.Store // Nos fichiers partagés (local)
-	Downloads   *merkle.Store // Datums téléchargés (distant)
+	MerkleStore *merkle.Store // Fichiers locaux
+	Downloads   *merkle.Store // Fichiers distants
 	RootHash    [32]byte
 
-	// Pour suivre les associations en attente
-	pendingHellos map[uint32]*net.UDPAddr
-	pendingMu     sync.Mutex
+	// Events
+	DatumDispatcher *DatumDispatcher
+	rootHashChan    chan [32]byte // Canal temporaire pour recevoir la réponse "Root"
+	rootHashMu      sync.Mutex
 
-	// Cache des clés publiques pour éviter les requêtes HTTP répétées
+	// Canal pour détecter les réceptions pendant pingSpam
+	PingResponseChan chan *net.UDPAddr
+	PingResponseMu   sync.Mutex
+
+	// Cache HTTP pour éviter de spammer l'annuaire
 	keyCache   map[string][]byte
 	keyCacheMu sync.RWMutex
 
-	// Canal pour notifier les téléchargements (pour le Downloader)
-	OnDatumReceived func(hash [32]byte, datum []byte)
-
-	// Canal pour notifier la réception du root hash
-	rootHashChan chan [32]byte
-
-	// Pour l'arrêt propre
 	shutdown chan struct{}
-	running  bool
 }
 
-// NewServer crée un nouveau serveur UDP
-func NewServer(conn *net.UDPConn, privKey *ecdsa.PrivateKey, myName string) *Server {
-	return &Server{
-		Conn:          conn,
-		PrivKey:       privKey,
-		MyName:        myName,
-		PeerManager:   peer.NewPeerManager(),
-		MerkleStore:   merkle.NewStore(),
-		Downloads:     merkle.NewStore(),
-		pendingHellos: make(map[uint32]*net.UDPAddr),
-		keyCache:      make(map[string][]byte),
-		shutdown:      make(chan struct{}),
-		running:       true,
+func NewServer(conn *net.UDPConn, key *ecdsa.PrivateKey, name string) *Server {
+	s := &Server{
+		Conn:            conn,
+		PrivKey:         key,
+		MyName:          name,
+		PeerManager:     peer.NewPeerManager(),
+		MerkleStore:     merkle.NewStore(),
+		Downloads:       merkle.NewStore(),
+		DatumDispatcher: NewDatumDispatcher(),
+		keyCache:        make(map[string][]byte),
+		shutdown:        make(chan struct{}),
+	}
+
+	// Configurer et démarrer l'actualisation automatique des pairs disponibles
+	s.PeerManager.SetFetchFunctions(GetListPeers, GetAddr)
+	s.PeerManager.StartAutoRefresh()
+
+	return s
+}
+
+// ListenLoop : Boucle principale
+func (s *Server) ListenLoop(ctx context.Context) {
+	buf := make([]byte, 65535) // max buffer
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.shutdown:
+			return
+		default:
+			// ReadFromUDP est bloquant, on compte sur le SetReadDeadline ou la fermeture du socket
+			n, remote, err := s.Conn.ReadFromUDP(buf)
+			if err != nil {
+				continue
+			}
+
+			// Copie nécessaire car buf est écrasé à la prochaine itération
+			packetData := make([]byte, n)
+			copy(packetData, buf[:n])
+
+			// Traitement asynchrone pour ne pas bloquer la boucle d'écoute
+			go s.handlePacket(remote, packetData)
+		}
 	}
 }
 
-// AddServerAsPeer ajoute le serveur central comme peer associé
-// Appelé après une connexion réussie pour éviter de devoir se réassocier manuellement
-func (s *Server) AddServerAsPeer(serverAddr *net.UDPAddr, serverName string) {
-	// Récupérer la clé publique du serveur
-	keyBytes, err := s.getPublicKey(serverName)
-	if err != nil || len(keyBytes) != 64 {
+// Stop ferme tout
+func (s *Server) Stop() {
+	s.PeerManager.Stop() // Arrêter la goroutine d'actualisation
+	close(s.shutdown)
+	s.Conn.Close()
+}
+
+// handlePacket : Le gros switch de dispatch
+func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
+	pkt, err := protocol.DecodePacket(data)
+	if err != nil {
+		return
+	}
+
+	// Log de la réception
+	typeName := protocol.GetTypeName(pkt.Header.Type)
+	if pkt.Header.Type != protocol.Datum {
+		fmt.Printf("📥 Réception %s ← %s (ID: %d)\n", typeName, addr, pkt.Header.ID)
+	}
+
+	// Notifier les listeners de pingSpam qu'on a reçu quelque chose
+	s.PingResponseMu.Lock()
+	if s.PingResponseChan != nil {
+		select {
+		case s.PingResponseChan <- addr:
+		default:
+		}
+	}
+	s.PingResponseMu.Unlock()
+
+	if p, ok := s.PeerManager.GetByAddr(addr); ok {
+		s.PeerManager.AddOrUpdate(p.Name, addr, p.PublicKey)
+	}
+
+	// Dispatch selon le type
+	switch pkt.Header.Type {
+
+	// --- PING / OK ---
+	case protocol.Ping:
+		SendOk(s.Conn, addr, pkt.Header.ID)
+	case protocol.Ok:
+	// --- HANDSHAKE ---
+	case protocol.Hello:
+		s.onHello(pkt, addr, false)
+
+	case protocol.HelloReply:
+		s.onHello(pkt, addr, true)
+
+	// --- MERKLE TREE ---
+	case protocol.RootRequest:
+		fmt.Printf("🌳 Demande de root hash de %s\n", addr)
+		SendRootReply(s.Conn, addr, s.RootHash, s.PrivKey, pkt.Header.ID)
+
+	case protocol.RootReply:
+		s.onRootReply(pkt, addr)
+
+	case protocol.DatumRequest:
+		s.onDatumRequest(pkt, addr)
+
+	case protocol.Datum:
+		s.onDatum(pkt)
+
+	case protocol.NoDatum:
+		// Juste pour info/debug
+		// fmt.Printf("Peer %s n'a pas le datum demandé\n", addr)
+
+	// --- NAT TRAVERSAL ---
+	case protocol.NatTraversalRequest:
+		// On me demande de faire le relais
+		s.onNatRequest(pkt, addr)
+
+	case protocol.NatTraversalRequest2:
+		// Le relais me dit de contacter quelqu'un
+		s.onNatRequest2(pkt, addr)
+
+	case protocol.Error:
+		fmt.Printf("⚠️ Erreur reçue de %s: %s\n", addr, string(pkt.Body))
+		if string(pkt.Body) == "please hello first" {
+			fmt.Println("🔄 Session perdue, tentative de reconnexion...")
+			SendHello(s.Conn, addr, s.MyName, s.PrivKey)
+			SendPing(s.Conn, addr)
+		}
+	}
+}
+
+// --- Handlers Spécifiques ---
+
+func (s *Server) onHello(pkt *protocol.Packet, addr *net.UDPAddr, isReply bool) {
+	_, name, err := protocol.DecodeHelloBody(pkt.Body)
+	if err != nil {
+		fmt.Printf("❌ Erreur décodage Hello de %s\n", addr)
+		return
+	}
+
+	// 1. Récup Clé Publique (Cache -> HTTP)
+	keyBytes, err := s.getPublicKey(name)
+	if err != nil {
+		fmt.Printf("Inconnu au bataillon: %s\n", name)
 		return
 	}
 	pubKey := crypto.ParsePublicKey(keyBytes)
-	s.PeerManager.AddOrUpdate(serverName, serverAddr, pubKey)
-}
 
-// Stop arrête proprement le serveur
-func (s *Server) Stop() {
-	if s.running {
-		s.running = false
-		close(s.shutdown)
-		s.Conn.Close()
+	// 2. Vérif Signature
+	if !crypto.VerifySignature(pubKey, pkt.DataToSign(), pkt.Signature) {
+		fmt.Printf("Bad signature from %s\n", name)
+		return
+	}
+
+	// 3. Enregistrement
+	s.PeerManager.AddOrUpdate(name, addr, pubKey)
+
+	if isReply {
+		fmt.Printf("✅ Connecté à %s (%s)\n", name, addr)
+	} else {
+		// Si c'est un Hello initial, on répond
+		SendHelloReply(s.Conn, addr, s.MyName, s.PrivKey, pkt.Header.ID)
 	}
 }
 
-// getPublicKey récupère la clé publique d'un peer (avec cache)
-func (s *Server) getPublicKey(peerName string) ([]byte, error) {
-	// Si c'est nous-mêmes, retourner notre propre clé publique
-	if peerName == s.MyName {
+func (s *Server) onDatumRequest(pkt *protocol.Packet, addr *net.UDPAddr) {
+	hash, err := protocol.DecodeHashBody(pkt.Body)
+	if err != nil {
+		return
+	}
+
+	// fmt.Printf("📦 Demande datum %x... de %s\n", hash[:8], addr)
+
+	// On cherche d'abord en local, sinon dans le cache téléchargé
+	data, ok := s.MerkleStore.Get(hash)
+	if !ok {
+		data, ok = s.Downloads.Get(hash)
+	}
+
+	if ok {
+		fmt.Printf("✅ Envoi datum %x... à %s\n", hash[:8], addr)
+		SendDatum(s.Conn, addr, hash, data, pkt.Header.ID)
+	} else {
+		fmt.Printf("❌ Datum %x... introuvable, envoi NoDatum à %s\n", hash[:8], addr)
+		SendNoDatum(s.Conn, addr, hash, s.PrivKey, pkt.Header.ID)
+	}
+}
+
+func (s *Server) onDatum(pkt *protocol.Packet) {
+	hash, val, err := protocol.DecodeDatumBody(pkt.Body)
+	if err != nil {
+		return
+	}
+
+	// fmt.Printf("📥 Réception datum %x... (%d bytes)\n", hash[:8], len(val))
+
+	// Vérif intégrité
+	if sha256.Sum256(val) != hash {
+		fmt.Println("❌ Datum corrompu reçu (Hash mismatch)")
+		return
+	}
+
+	// Stockage
+	s.Downloads.Set(hash, val)
+	// fmt.Printf("💾 Datum %x... stocké dans Downloads\n", hash[:8])
+
+	// Notification aux downloaders en attente
+	s.DatumDispatcher.Dispatch(hash, val)
+}
+
+func (s *Server) onRootReply(pkt *protocol.Packet, addr *net.UDPAddr) {
+	rootHash, err := protocol.DecodeHashBody(pkt.Body)
+	if err != nil {
+		return
+	}
+
+	fmt.Printf("🌳 Réception root hash %x... de %s\n", rootHash, addr)
+
+	// Vérif signature
+	peer, ok := s.PeerManager.GetByAddr(addr)
+	if !ok {
+		return
+	}
+
+	if !crypto.VerifySignature(peer.PublicKey, pkt.DataToSign(), pkt.Signature) {
+		return
+	}
+
+	// Transmission au channel en attente
+	s.rootHashMu.Lock()
+	if s.rootHashChan != nil {
+		// Non-bloquant au cas où personne n'écoute
+		select {
+		case s.rootHashChan <- rootHash:
+		default:
+		}
+	}
+	s.rootHashMu.Unlock()
+}
+
+// Logique NAT (Relais)
+func (s *Server) onNatRequest(pkt *protocol.Packet, srcAddr *net.UDPAddr) {
+	// Src demande à contacter Target via nous
+	targetStruct, err := protocol.DecodeSocketAddress(pkt.Body)
+	if err != nil {
+		return
+	}
+
+	// On vérifie la signature de Src
+	p, ok := s.PeerManager.GetByAddr(srcAddr)
+	if !ok || !crypto.VerifySignature(p.PublicKey, pkt.DataToSign(), pkt.Signature) {
+		fmt.Printf("❌ NatRequest d'un peer inconnu ou mauvaise signature: %s\n", srcAddr)
+		return
+	}
+
+	// On dit OK à Src
+	SendOk(s.Conn, srcAddr, pkt.Header.ID)
+
+	// On envoie une notif à Target
+	targetAddr := targetStruct.ToUDPAddr()
+	fmt.Printf("🔀 NAT: %s veut contacter %s via nous\n", srcAddr, targetAddr)
+
+	// Dans le message pour Target, on met l'adresse de Src (pour qu'il sache qui pinguer)
+	SendNatTraversalRequest2(s.Conn, targetAddr, srcAddr, s.PrivKey)
+}
+
+func (s *Server) onNatRequest2(pkt *protocol.Packet, relayAddr *net.UDPAddr) {
+	// Le Relais nous dit que Src veut nous parler
+	srcStruct, err := protocol.DecodeSocketAddress(pkt.Body)
+	if err != nil {
+		return
+	}
+
+	// Vérification de la signature du relais
+	relay, ok := s.PeerManager.GetByAddr(relayAddr)
+	if !ok || !crypto.VerifySignature(relay.PublicKey, pkt.DataToSign(), pkt.Signature) {
+		fmt.Printf("❌ NatRequest2 d'un relais inconnu: %s\n", relayAddr)
+		return
+	}
+
+	// On dit merci au relais
+	SendOk(s.Conn, relayAddr, pkt.Header.ID)
+
+	srcAddr := srcStruct.ToUDPAddr()
+	fmt.Printf("🔀 NAT: %s nous demande de pinguer %s\n", relayAddr, srcAddr)
+
+	// Créer un canal pour détecter les réceptions de cette adresse
+	responseChan := make(chan *net.UDPAddr, 10)
+	s.PingResponseMu.Lock()
+	s.PingResponseChan = responseChan
+	s.PingResponseMu.Unlock()
+
+	defer func() {
+		s.PingResponseMu.Lock()
+		s.PingResponseChan = nil
+		s.PingResponseMu.Unlock()
+	}()
+
+	// Canal pour détecter le succès
+	success := make(chan bool, 1)
+	go func() {
+		for {
+			select {
+			case receivedAddr := <-responseChan:
+				if receivedAddr.String() == srcAddr.String() {
+					select {
+					case success <- true:
+					default:
+					}
+					return
+				}
+			case <-time.After(1 * time.Second):
+				select {
+				case success <- false:
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	// Envoyer des pings jusqu'à réponse ou timeout
+	for range 5 {
+		select {
+		case <-success:
+			return // Succès, on arrête
+		default:
+			SendPing(s.Conn, srcAddr)
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	// Attendre le résultat final
+	select {
+	case <-success:
+		return
+	case <-time.After(200 * time.Millisecond):
+		fmt.Printf("⏱️ Timeout NAT avec %s\n", srcAddr)
+	}
+}
+
+// --- Utils ---
+
+func (s *Server) getPublicKey(name string) ([]byte, error) {
+	if name == s.MyName {
 		return crypto.PublicKeyToBytes(&s.PrivKey.PublicKey), nil
 	}
 
-	// Vérifier le cache
 	s.keyCacheMu.RLock()
-	if key, ok := s.keyCache[peerName]; ok {
+	if k, ok := s.keyCache[name]; ok {
 		s.keyCacheMu.RUnlock()
-		return key, nil
+		return k, nil
 	}
 	s.keyCacheMu.RUnlock()
 
-	// Récupérer depuis le serveur HTTP
-	keyBytes, err := GetKey(peerName)
+	// Appel HTTP (bloquant, mais bon...)
+	key, err := GetKey(name)
 	if err != nil {
 		return nil, err
 	}
 
-	// Mettre en cache
 	s.keyCacheMu.Lock()
-	s.keyCache[peerName] = keyBytes
+	s.keyCache[name] = key
 	s.keyCacheMu.Unlock()
-
-	return keyBytes, nil
+	return key, nil
 }
 
-// SetMerkleRoot définit le hash racine du Merkle tree
-func (s *Server) SetMerkleRoot(store *merkle.Store, rootHash [32]byte) {
+// SetRootHashChan permet au menu d'attendre une réponse
+func (s *Server) SetRootHashChan(ch chan [32]byte) {
+	s.rootHashMu.Lock()
+	s.rootHashChan = ch
+	s.rootHashMu.Unlock()
+}
+
+func (s *Server) SetMerkleRoot(store *merkle.Store, root [32]byte) {
 	s.MerkleStore = store
-	s.RootHash = rootHash
+	s.RootHash = root
 }
 
-// ListenLoop boucle principale d'écoute UDP
-func (s *Server) ListenLoop() {
-	buffer := make([]byte, 4096)
-	for s.running {
-		n, remoteAddr, err := s.Conn.ReadFromUDP(buffer)
-		if err != nil {
-			// Vérifier si c'est une fermeture normale
-			if !s.running {
-				return
-			}
-			fmt.Println("❌ Erreur lecture UDP:", err)
-			continue
-		}
-
-		data := make([]byte, n)
-		copy(data, buffer[:n])
-
-		go s.handlePacket(remoteAddr, data)
-	}
-}
-
-// handlePacket traite un paquet reçu
-func (s *Server) handlePacket(remoteAddr *net.UDPAddr, data []byte) {
-	// Décoder le paquet avec les structures du protocole
-	packet, err := protocol.DecodePacket(data)
-	if err != nil {
-		return
-	}
-
-	// Données à vérifier pour la signature (header + body)
-	dataToVerify := packet.DataToSign()
-
-	switch packet.Header.Type {
-	case protocol.Hello:
-		s.processHello(packet.Header.ID, packet.Body, packet.Signature, dataToVerify, remoteAddr)
-	case protocol.HelloReply:
-		s.processHelloReply(packet.Header.ID, packet.Body, packet.Signature, dataToVerify, remoteAddr)
-	case protocol.Ping:
-		SendOk(s.Conn, remoteAddr, packet.Header.ID)
-	case protocol.Ok:
-		// Silencieux
-	case protocol.RootRequest:
-		s.processRootRequest(packet.Header.ID, remoteAddr)
-	case protocol.RootReply:
-		s.processRootReply(packet.Header.ID, packet.Body, packet.Signature, dataToVerify, remoteAddr)
-	case protocol.DatumRequest:
-		s.processDatumRequest(packet.Header.ID, packet.Body, remoteAddr)
-	case protocol.Datum:
-		s.processDatum(packet.Header.ID, packet.Body, remoteAddr)
-	case protocol.NoDatum:
-		s.processNoDatum(packet.Header.ID, packet.Body, packet.Signature, dataToVerify, remoteAddr)
-	case protocol.Error:
-		fmt.Printf("❌ Erreur de %s: %s\n", remoteAddr, string(packet.Body))
-	case protocol.NatTraversalRequest:
-		s.processNatTraversalRequest(packet.Header.ID, packet.Body, packet.Signature, dataToVerify, remoteAddr)
-	case protocol.NatTraversalRequest2:
-		s.processNatTraversalRequest2(packet.Header.ID, packet.Body, packet.Signature, dataToVerify, remoteAddr)
-	default:
-		// Message inconnu ignoré
-	}
-}
-
-// processHello traite un message Hello reçu
-func (s *Server) processHello(id uint32, body []byte, signature []byte, dataToVerify []byte, addr *net.UDPAddr) {
-	if len(signature) != protocol.SignatureSize {
-		return
-	}
-
-	// Décoder le body avec la structure du protocole
-	extensions, remoteName, err := protocol.DecodeHelloBody(body)
-	if err != nil {
-		return
-	}
-	_ = extensions // Réservé pour extensions futures
-
-	keyBytes, err := s.getPublicKey(remoteName)
-	if err != nil || len(keyBytes) != 64 {
-		return
-	}
-
-	pubKey := crypto.ParsePublicKey(keyBytes)
-	if !crypto.VerifySignature(pubKey, dataToVerify, signature) {
-		return
-	}
-
-	fmt.Printf("🔗 Hello de %s (%s)\n", remoteName, addr)
-	s.PeerManager.AddOrUpdate(remoteName, addr, pubKey)
-	SendHelloReply(s.Conn, addr, s.MyName, s.PrivKey, id)
-}
-
-// processHelloReply traite une réponse HelloReply
-func (s *Server) processHelloReply(_ uint32, body []byte, signature []byte, dataToVerify []byte, addr *net.UDPAddr) {
-	if len(signature) != protocol.SignatureSize {
-		return
-	}
-
-	// Décoder le body avec la structure du protocole
-	extensions, remoteName, err := protocol.DecodeHelloBody(body)
-	if err != nil {
-		return
-	}
-	_ = extensions // Réservé pour extensions futures
-
-	keyBytes, err := s.getPublicKey(remoteName)
-	if err != nil || len(keyBytes) != 64 {
-		return
-	}
-
-	pubKey := crypto.ParsePublicKey(keyBytes)
-	if !crypto.VerifySignature(pubKey, dataToVerify, signature) {
-		return
-	}
-
-	fmt.Printf("✅ Connecté à %s (%s)\n", remoteName, addr)
-	s.PeerManager.AddOrUpdate(remoteName, addr, pubKey)
-}
-
-// processRootRequest répond avec notre hash racine
-func (s *Server) processRootRequest(id uint32, addr *net.UDPAddr) {
-	SendRootReply(s.Conn, addr, s.RootHash, s.PrivKey, id)
-}
-
-// processRootReply traite une réponse RootReply
-func (s *Server) processRootReply(_ uint32, body []byte, signature []byte, dataToVerify []byte, addr *net.UDPAddr) {
-	if len(signature) != protocol.SignatureSize {
-		return
-	}
-
-	// Décoder le hash avec la structure du protocole
-	rootHash, err := protocol.DecodeHashBody(body)
-	if err != nil {
-		return
-	}
-
-	peerInfo, ok := s.PeerManager.GetByAddr(addr)
-	if !ok {
-		return
-	}
-
-	if !crypto.VerifySignature(peerInfo.PublicKey, dataToVerify, signature) {
-		return
-	}
-
-	if s.rootHashChan != nil {
-		s.rootHashChan <- rootHash
-	}
-
-	fmt.Printf("🌳 Root hash de %s: %x\n", peerInfo.Name, rootHash)
-}
-
-// processDatumRequest répond avec le datum demandé
-func (s *Server) processDatumRequest(id uint32, body []byte, addr *net.UDPAddr) {
-	// Décoder le hash demandé
-	hash, err := protocol.DecodeHashBody(body)
-	if err != nil {
-		return
-	}
-
-	datum, found := s.MerkleStore.Get(hash)
-	if !found {
-		datum, found = s.Downloads.Get(hash)
-	}
-
-	if found {
-		SendDatum(s.Conn, addr, hash, datum, id)
-	} else {
-		SendNoDatum(s.Conn, addr, hash, s.PrivKey, id)
-	}
-}
-
-// processDatum traite un Datum reçu
-func (s *Server) processDatum(_ uint32, body []byte, _ *net.UDPAddr) {
-	// Décoder le datum avec la structure du protocole
-	expectedHash, value, err := protocol.DecodeDatumBody(body)
-	if err != nil {
-		return
-	}
-
-	// Vérifier l'intégrité via le hash Merkle
-	computedHash := merkle.HashData(value)
-	if computedHash != expectedHash {
-		return
-	}
-
-	s.Downloads.Set(expectedHash, value)
-
-	if s.OnDatumReceived != nil {
-		s.OnDatumReceived(expectedHash, value)
-	}
-}
-
-// processNoDatum traite un NoDatum reçu
-func (s *Server) processNoDatum(_ uint32, body []byte, signature []byte, dataToVerify []byte, addr *net.UDPAddr) {
-	if len(signature) != protocol.SignatureSize {
-		return
-	}
-
-	// Décoder le hash
-	_, err := protocol.DecodeHashBody(body)
-	if err != nil {
-		return
-	}
-
-	peerInfo, ok := s.PeerManager.GetByAddr(addr)
-	if !ok {
-		return
-	}
-
-	if !crypto.VerifySignature(peerInfo.PublicKey, dataToVerify, signature) {
-		return
-	}
-}
-
-// processNatTraversalRequest traite une demande de NAT traversal (type 4)
-func (s *Server) processNatTraversalRequest(id uint32, body []byte, signature []byte, dataToVerify []byte, addr *net.UDPAddr) {
-	if len(signature) != protocol.SignatureSize {
-		return
-	}
-
-	// Décoder l'adresse cible avec la structure du protocole
-	socketAddr, err := protocol.DecodeSocketAddress(body)
-	if err != nil {
-		return
-	}
-	targetAddr := socketAddr.ToUDPAddr()
-
-	peerInfo, ok := s.PeerManager.GetByAddr(addr)
-	if !ok || !crypto.VerifySignature(peerInfo.PublicKey, dataToVerify, signature) {
-		return
-	}
-
-	SendOk(s.Conn, addr, id)
-	SendNatTraversalRequest2(s.Conn, targetAddr, addr, s.PrivKey)
-}
-
-// processNatTraversalRequest2 traite une demande de NAT traversal relay (type 5)
-// Réponse: envoie Ok à l'expéditeur, puis Ping à l'adresse contenue dans le body
-func (s *Server) processNatTraversalRequest2(id uint32, body []byte, signature []byte, _ []byte, addr *net.UDPAddr) {
-	if len(signature) != protocol.SignatureSize {
-		return
-	}
-
-	// Décoder l'adresse cible avec la structure du protocole
-	socketAddr, err := protocol.DecodeSocketAddress(body)
-	if err != nil {
-		return
-	}
-	targetAddr := socketAddr.ToUDPAddr()
-
-	SendOk(s.Conn, addr, id)
-	SendPing(s.Conn, targetAddr)
-}
-
-// KeepAlive envoie des Ping périodiques pour maintenir les associations
-// Envoie sur les deux adresses du serveur (IPv4 et IPv6) pour garder les deux publiées
-func (s *Server) KeepAlive(serverAddr *net.UDPAddr, interval time.Duration) {
+// KeepAlive : Simple loop qui ping les copains
+func (s *Server) KeepAlive(serverAddr *net.UDPAddr, interval time.Duration, ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	// Résoudre les deux adresses du serveur
-	serverAddrV4, _ := net.ResolveUDPAddr("udp", protocol.ServerUDPv4)
-	serverAddrV6, _ := net.ResolveUDPAddr("udp", protocol.ServerUDPv6)
-
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-s.shutdown:
 			return
 		case <-ticker.C:
-			// Ping le serveur sur les DEUX adresses pour maintenir les deux IP publiées
-			if serverAddrV4 != nil {
-				SendPing(s.Conn, serverAddrV4)
+			// 1. Ping le serveur central (IPv4 et v6 si dispo)
+			// On force la ré-résolution pour gérer le changement d'IP DNS éventuel
+			if addr, err := net.ResolveUDPAddr("udp", protocol.GetServerUDPv6()); err == nil {
+				SendPing(s.Conn, addr)
 			}
-			if serverAddrV6 != nil {
-				SendPing(s.Conn, serverAddrV6)
+			if addr, err := net.ResolveUDPAddr("udp", protocol.GetServerUDPv4()); err == nil {
+				SendPing(s.Conn, addr)
 			}
 
-			// Nettoyer les peers expirés
+			// 2. Ping tous les pairs connectés (toutes leurs adresses)
+			connectedPeers := s.PeerManager.List()
+			for _, peerName := range connectedPeers {
+				if peerInfo, ok := s.PeerManager.Get(peerName); ok && peerInfo.Name != "jch.irif.fr" {
+					for _, addr := range peerInfo.Addrs {
+						SendPing(s.Conn, addr)
+					}
+				}
+			}
+
+			// 3. Nettoyage
 			s.PeerManager.CleanExpired()
 		}
 	}
-}
-
-func (s *Server) SetRootHashChan(ch chan [32]byte) {
-	s.rootHashChan = ch
 }
