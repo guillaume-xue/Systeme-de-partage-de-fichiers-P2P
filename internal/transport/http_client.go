@@ -119,7 +119,7 @@ func SendPacket(conn *net.UDPConn, destAddr *net.UDPAddr, msgID uint32, msgType 
 		return fmt.Errorf("erreur envoi Message: %w", err)
 	}
 
-	fmt.Printf("Message envoyé à %s (ID:%d)\n", destAddr, msgID)
+	fmt.Printf("Message type %d envoyé à %s (ID:%d)\n", msgType, destAddr, msgID)
 	return nil
 }
 
