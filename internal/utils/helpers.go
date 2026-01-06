@@ -3,6 +3,8 @@ package utils
 import (
 	"encoding/hex"
 	"fmt"
+	"main/internal/protocol"
+	"net"
 	"strings"
 )
 
@@ -55,4 +57,52 @@ func CleanName(pName string) string {
 		}
 		return '_'
 	}, pName)
+}
+
+// detectLocalIPProtocol détecte si on supporte IPv4 et/ou IPv6
+func DetectLocalIPProtocol() (hasIPv4 bool, hasIPv6 bool) {
+	// Tester IPv4
+	if _, err := net.ResolveUDPAddr("udp4", protocol.GetServerUDPv4()); err == nil {
+		hasIPv4 = true
+	}
+
+	// Tester IPv6
+	if _, err := net.ResolveUDPAddr("udp6", protocol.GetServerUDPv6()); err == nil {
+		hasIPv6 = true
+	}
+
+	return hasIPv4, hasIPv6
+}
+
+
+func FiltrerAddressesByProtocol(filteredTargets, filteredRelayAddrs []*net.UDPAddr) (bool, []*net.UDPAddr, []*net.UDPAddr, []*net.UDPAddr, []*net.UDPAddr) {
+
+	// Séparer les adresses par protocole
+	var targetIPv4, targetIPv6 []*net.UDPAddr
+	for _, addr := range filteredTargets {
+		if addr.IP.To4() != nil {
+			targetIPv4 = append(targetIPv4, addr)
+		} else {
+			targetIPv6 = append(targetIPv6, addr)
+		}
+	}
+
+	var relayIPv4, relayIPv6 []*net.UDPAddr
+	for _, addr := range filteredRelayAddrs {
+		if addr.IP.To4() != nil {
+			relayIPv4 = append(relayIPv4, addr)
+		} else {
+			relayIPv6 = append(relayIPv6, addr)
+		}
+	}
+
+	// Vérifier qu'il y a au moins un protocole compatible
+	hasCompatibleProtocol := (len(targetIPv4) > 0 && len(relayIPv4) > 0) ||
+		(len(targetIPv6) > 0 && len(relayIPv6) > 0)
+
+	if !hasCompatibleProtocol {
+		return false, nil, nil, nil, nil
+	}
+
+	return true, targetIPv4, targetIPv6, relayIPv4, relayIPv6
 }

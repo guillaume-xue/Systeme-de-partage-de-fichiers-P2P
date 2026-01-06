@@ -28,6 +28,10 @@ type Downloader struct {
 	retries map[[32]byte]int
 	mu      sync.Mutex
 
+	// Stats de progression
+	totalReceived int
+	statsMu       sync.Mutex
+
 	// Communication interne
 	workCh     chan [32]byte // File d'attente des hash à demander
 	responseCh chan [32]byte // Signal de réception
@@ -108,6 +112,14 @@ func (d *Downloader) DownloadTree(rootHash [32]byte) {
 
 		queued := len(d.workCh)
 
+		d.statsMu.Lock()
+		received := d.totalReceived
+		d.statsMu.Unlock()
+
+		// Affichage de progression
+		fmt.Printf("\r📊 Progression: %d reçus | En cours: %d | File d'attente: %d | Fenêtre: %d",
+			received, inflight, queued, d.windowSize)
+
 		if inflight == 0 && queued == 0 {
 			// Petite sécurité supplémentaire
 			time.Sleep(100 * time.Millisecond)
@@ -115,9 +127,6 @@ func (d *Downloader) DownloadTree(rootHash [32]byte) {
 				break
 			}
 		}
-
-		// Debug visuel optionnel
-		// fmt.Printf("\rWaiting... Pending: %d | Queue: %d", inflight, queued)
 	}
 
 	d.Stop()
@@ -155,7 +164,7 @@ func (d *Downloader) senderLoop() {
 			return
 		}
 
-		// 3. Check si on l'a déjà 
+		// 3. Check si on l'a déjà
 		if _, exists := d.server.Downloads.Get(hash); exists {
 			// On l'a déjà, mais il faut peut-être explorer ses enfants !
 			// On relance l'analyse des enfants pour être sûr d'avoir tout l'arbre.
@@ -197,6 +206,11 @@ func (d *Downloader) responseLoop() {
 			delete(d.retries, hash)
 		}
 		d.mu.Unlock()
+
+		// Incrémenter les stats
+		d.statsMu.Lock()
+		d.totalReceived++
+		d.statsMu.Unlock()
 
 		// Si on a reçu le datum, il faut aller chercher ses enfants
 		// (Récursion pour tout télécharger)

@@ -55,8 +55,10 @@ type DiskDownloader struct {
 	cacheMu sync.RWMutex
 
 	// Stats
-	savedFiles int
-	savedBytes int64
+	savedFiles    int
+	savedBytes    int64
+	totalReceived int
+	statsMu       sync.Mutex
 
 	// Lifecycle
 	wg          sync.WaitGroup
@@ -149,10 +151,21 @@ func (d *DiskDownloader) waitFinish() {
 
 		d.pendingMu.Lock()
 		inflightCount := len(d.inflight)
+		windowSize := d.window
 		d.pendingMu.Unlock()
 
+		queuedCount := len(d.workQueue)
+
+		d.statsMu.Lock()
+		received := d.totalReceived
+		d.statsMu.Unlock()
+
+		// Affichage de progression
+		fmt.Printf("\r💾 Téléchargement: %d reçus (%d fichiers, %s) | En cours: %d | File: %d | Fenêtre: %d",
+			received, d.savedFiles, utils.FormatBytesInt64(d.savedBytes), inflightCount, queuedCount, windowSize)
+
 		// Si plus rien en cours, plus rien dans la queue, on suppose que c'est fini
-		if inflightCount == 0 && len(d.workQueue) == 0 {
+		if inflightCount == 0 && queuedCount == 0 {
 			// Petite pause de sécurité pour être sûr qu'un process en cours n'ajoute pas un truc
 			time.Sleep(500 * time.Millisecond)
 			if len(d.inflight) == 0 && len(d.workQueue) == 0 {
@@ -178,7 +191,7 @@ func (d *DiskDownloader) onDatumReceived(hash [32]byte, data []byte) {
 	}
 }
 
-// WORKER 1 : Envoie les requêtes 
+// WORKER 1 : Envoie les requêtes
 func (d *DiskDownloader) senderLoop() {
 	defer d.wg.Done()
 
@@ -246,6 +259,11 @@ func (d *DiskDownloader) processorLoop() {
 	defer d.wg.Done()
 
 	for hash := range d.responseCh {
+		// Incrémenter les stats
+		d.statsMu.Lock()
+		d.totalReceived++
+		d.statsMu.Unlock()
+
 		d.pendingMu.Lock()
 		start, ok := d.inflight[hash]
 		if ok {
@@ -391,7 +409,7 @@ func (d *DiskDownloader) finalizeBigFiles() {
 		return
 	}
 
-	fmt.Printf("🔨 Reconstruction de %d gros fichiers...\n", len(d.bigFiles))
+	fmt.Printf("\n🔨 Reconstruction de %d gros fichiers...\n", len(d.bigFiles))
 
 	for hash, path := range d.bigFiles {
 		fmt.Printf("📦 Reconstruction %s...\n", filepath.Base(path))

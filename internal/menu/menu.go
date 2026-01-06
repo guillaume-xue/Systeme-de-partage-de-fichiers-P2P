@@ -6,7 +6,6 @@ import (
 	"main/internal/config"
 	"main/internal/merkle"
 	"main/internal/peer"
-	"main/internal/protocol"
 	"main/internal/transport"
 	"main/internal/utils"
 	"net"
@@ -22,13 +21,20 @@ type InteractiveMenu struct {
 	serverAddr   *net.UDPAddr
 	scanner      *bufio.Scanner
 	rootHashChan chan [32]byte
+	hasIPv4      bool
+	hasIPv6      bool
 }
 
 func NewMenu(server *transport.Server, serverAddr *net.UDPAddr) *InteractiveMenu {
+	// Détecter les protocols IP locales une seule fois
+	hasIPv4, hasIPv6 := utils.DetectLocalIPProtocol()
+
 	return &InteractiveMenu{
 		server:     server,
 		serverAddr: serverAddr,
 		scanner:    bufio.NewScanner(os.Stdin),
+		hasIPv4:    hasIPv4,
+		hasIPv6:    hasIPv6,
 	}
 }
 
@@ -67,7 +73,7 @@ func (m *InteractiveMenu) Run() {
 			m.server.Stop()
 			return
 		default:
-			fmt.Println("Option inconnue.")
+			fmt.Println("❌ Choix invalide")
 		}
 	}
 }
@@ -126,6 +132,13 @@ func (m *InteractiveMenu) connectToPeer() {
 		fmt.Println("Pas d'adresses valides trouvées.")
 		return
 	}
+
+	targets = m.filterAddressesByProtocol(targets)
+	if len(targets) == 0 {
+		fmt.Println("Aucune adresse compatible avec nos protocols IP.")
+		return
+	}
+
 	fmt.Println("Tentative de connexion...")
 
 	// Phase 1: Tentatives de connexion directe
@@ -146,29 +159,21 @@ func (m *InteractiveMenu) connectToPeer() {
 		m.server.PingResponseChan = responseChan
 		m.server.PingResponseMu.Unlock()
 
-		var natPierced bool
 		if relayChoice == "" || relayChoice == "default" {
 			// Utiliser le serveur central
-			fmt.Println("Tentative NAT traversal via serveur central...")
-			m.sendNatTraversalRequests(targets)
-			natPierced = m.pingSpam(targets, pName, 5, responseChan)
-		} else {
-			// Utiliser un peer comme relais
-			fmt.Printf("Tentative NAT traversal via peer %s...\n", relayChoice)
-			if hasSucces := m.sendNatTraversalViaPeer(targets, relayChoice); hasSucces {
-				natPierced = m.pingSpam(targets, pName, 5, responseChan)
-			}
+			relayChoice = "jch.irif.fr"
 		}
+		fmt.Printf("--- Tentative NAT traversal via %s... ---\n", relayChoice)
+		natPierced, usedAddrs := m.sendNatTraversalViaPeer(targets, relayChoice, responseChan, pName)
 
 		// Cleanup du canal
 		m.server.PingResponseMu.Lock()
 		m.server.PingResponseChan = nil
 		m.server.PingResponseMu.Unlock()
 
-		// Si le NAT est percé, tenter la connexion avec Hello
+		// Si le NAT est percé, tenter la connexion avec Hello sur les adresses qui ont fonctionné
 		if natPierced {
-			fmt.Println("NAT traversal réussi, tentative de connexion avec Hello...")
-			isConnected = m.sendDirectConnection(targets, pName, 5)
+			isConnected = m.sendDirectConnection(usedAddrs, pName, 5)
 		}
 	}
 
@@ -355,41 +360,70 @@ func (m *InteractiveMenu) sendDirectConnection(addresses []*net.UDPAddr, pName s
 	return false
 }
 
-// Envoie les requêtes NAT traversal au serveur
-func (m *InteractiveMenu) sendNatTraversalRequests(targetAddresses []*net.UDPAddr) {
-	for _, targetAddr := range targetAddresses {
-		var relayServerAddr *net.UDPAddr
-		if targetAddr.IP.To4() != nil {
-			relayServerAddr, _ = net.ResolveUDPAddr("udp", protocol.GetServerUDPv4())
-		} else {
-			relayServerAddr, _ = net.ResolveUDPAddr("udp", protocol.GetServerUDPv6())
-		}
-		if relayServerAddr != nil {
-			transport.SendNatTraversalRequest(m.server.Conn, relayServerAddr, targetAddr, m.server.PrivKey)
-		} else {
-			fmt.Printf("Impossible de résoudre l'adresse du serveur de relais pour %s\n", targetAddr.String())
-		}
-	}
-}
-
 // sendNatTraversalViaPeer utilise un peer comme relais pour le NAT traversal
-func (m *InteractiveMenu) sendNatTraversalViaPeer(targetAddresses []*net.UDPAddr, relayPeerName string) bool {
+func (m *InteractiveMenu) sendNatTraversalViaPeer(targetAddresses []*net.UDPAddr, relayPeerName string, responseChan chan *net.UDPAddr, pName string) (bool, []*net.UDPAddr) {
 	// Vérifier que le peer relais est connecté
 	relayPeer, exists := m.server.PeerManager.Get(relayPeerName)
 	if !exists {
 		fmt.Printf("❌ Peer relais %s non connecté. Vous devez d'abord être connecté avec ce peer.\n", relayPeerName)
-		return false
+		return false, nil
 	}
 
-	fmt.Printf("Utilisation de %s comme relais (%d adresse(s))\n", relayPeerName, len(relayPeer.Addrs))
+	fmt.Printf("🚀 Utilisation de %s comme relais (%d adresse(s))\n", relayPeerName, len(relayPeer.Addrs))
 
-	// Envoyer les requêtes au peer relais
-	for _, targetAddr := range targetAddresses {
-		for _, relayAddr := range relayPeer.Addrs {
-			transport.SendNatTraversalRequest(m.server.Conn, relayAddr, targetAddr, m.server.PrivKey)
+	// Filtrer les adresses en fonction de nos protocols
+	filteredTargets := m.filterAddressesByProtocol(targetAddresses)
+	if len(filteredTargets) == 0 {
+		fmt.Println("❌ Aucune adresse cible compatible avec nos protocols IP.")
+		return false, nil
+	}
+
+	filteredRelayAddrs := m.filterAddressesByProtocol(relayPeer.Addrs)
+	if len(filteredRelayAddrs) == 0 {
+		fmt.Printf("❌ Le peer relais %s n'a pas d'adresses compatibles avec nos protocols IP.\n", relayPeerName)
+		return false, nil
+	}
+
+	res, targetIPv4, targetIPv6, relayIPv4, relayIPv6 := utils.FiltrerAddressesByProtocol(filteredTargets, filteredRelayAddrs)
+	if !res {
+		fmt.Printf("❌ Aucun protocole compatible entre le relais %s et la cible.\n", relayPeerName)
+		return false, nil
+	}
+
+	// Essayer IPv6 d'abord si disponible
+	if len(targetIPv6) > 0 && len(relayIPv6) > 0 {
+		fmt.Println("🔄 Tentative via IPv6...")
+		for _, targetAddr := range targetIPv6 {
+			for _, relayAddr := range relayIPv6 {
+				transport.SendNatTraversalRequest(m.server.Conn, relayAddr, targetAddr, m.server.PrivKey)
+			}
+		}
+
+		// Tester avec pingSpam
+		if m.pingSpam(targetIPv6, pName, 5, responseChan) {
+			fmt.Println("✅ NAT traversal réussi via IPv6")
+			return true, targetIPv6
+		}
+		fmt.Println("⚠️ IPv6 a échoué, tentative via IPv4...")
+	}
+
+	// Essayer IPv4 si IPv6 a échoué ou n'était pas disponible
+	if len(targetIPv4) > 0 && len(relayIPv4) > 0 {
+		fmt.Println("🔄 Tentative via IPv4...")
+		for _, targetAddr := range targetIPv4 {
+			for _, relayAddr := range relayIPv4 {
+				transport.SendNatTraversalRequest(m.server.Conn, relayAddr, targetAddr, m.server.PrivKey)
+			}
+		}
+
+		// Tester avec pingSpam
+		if m.pingSpam(targetIPv4, pName, 5, responseChan) {
+			fmt.Println("✅ NAT traversal réussi via IPv4")
+			return true, targetIPv4
 		}
 	}
-	return true
+
+	return false, nil
 }
 
 // pingSpam envoie plusieurs pings pour percer le NAT
@@ -517,4 +551,29 @@ func (m *InteractiveMenu) getRootHashFromPeer(pInfo *peer.PeerInfo, pName string
 
 	m.server.SetRootHashChan(nil)
 	return targetHash
+}
+
+// filterAddressesByProtocol filtre les adresses en fonction des protocols locales
+func (m *InteractiveMenu) filterAddressesByProtocol(addresses []*net.UDPAddr) []*net.UDPAddr {
+	if !m.hasIPv4 && !m.hasIPv6 {
+		fmt.Println("⚠️ Aucun protocole IP disponible !")
+		return nil
+	}
+
+	var filtered []*net.UDPAddr
+	for _, addr := range addresses {
+		isIPv4 := addr.IP.To4() != nil
+
+		if isIPv4 && m.hasIPv4 {
+			filtered = append(filtered, addr)
+		} else if !isIPv4 && m.hasIPv6 {
+			filtered = append(filtered, addr)
+		}
+	}
+
+	if len(filtered) == 0 {
+		fmt.Println("⚠️ Aucune adresse compatible avec nos protocols IP")
+	}
+
+	return filtered
 }

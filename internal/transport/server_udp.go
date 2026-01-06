@@ -97,6 +97,7 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 
 	// Log de la réception
 	typeName := protocol.GetTypeName(pkt.Header.Type)
+	// Juste pour éviter les spams de datum
 	if pkt.Header.Type != protocol.Datum {
 		fmt.Printf("📥 Réception %s ← %s (ID: %d)\n", typeName, addr, pkt.Header.ID)
 	}
@@ -131,16 +132,32 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 
 	// --- MERKLE TREE ---
 	case protocol.RootRequest:
+		if _, ok := s.PeerManager.GetByAddr(addr); !ok {
+			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
+			return
+		}
 		fmt.Printf("🌳 Demande de root hash de %s\n", addr)
 		SendRootReply(s.Conn, addr, s.RootHash, s.PrivKey, pkt.Header.ID)
 
 	case protocol.RootReply:
+		if _, ok := s.PeerManager.GetByAddr(addr); !ok {
+			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
+			return
+		}
 		s.onRootReply(pkt, addr)
 
 	case protocol.DatumRequest:
+		if _, ok := s.PeerManager.GetByAddr(addr); !ok {
+			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
+			return
+		}
 		s.onDatumRequest(pkt, addr)
 
 	case protocol.Datum:
+		if _, ok := s.PeerManager.GetByAddr(addr); !ok {
+			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
+			return
+		}
 		s.onDatum(pkt)
 
 	case protocol.NoDatum:
@@ -149,10 +166,18 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 
 	// --- NAT TRAVERSAL ---
 	case protocol.NatTraversalRequest:
+		if _, ok := s.PeerManager.GetByAddr(addr); !ok {
+			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
+			return
+		}
 		// On me demande de faire le relais
 		s.onNatRequest(pkt, addr)
 
 	case protocol.NatTraversalRequest2:
+		if _, ok := s.PeerManager.GetByAddr(addr); !ok {
+			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
+			return
+		}
 		// Le relais me dit de contacter quelqu'un
 		s.onNatRequest2(pkt, addr)
 
@@ -229,7 +254,7 @@ func (s *Server) onDatum(pkt *protocol.Packet) {
 		return
 	}
 
-	// fmt.Printf("📥 Réception datum %x... (%d bytes)\n", hash[:8], len(val))
+	// fmt.Printf("📥 Réception datum %x... (%d bytes)\n", hash, len(val))
 
 	// Vérif intégrité
 	if sha256.Sum256(val) != hash {
@@ -438,13 +463,16 @@ func (s *Server) KeepAlive(serverAddr *net.UDPAddr, interval time.Duration, ctx 
 		case <-s.shutdown:
 			return
 		case <-ticker.C:
+			fmt.Println()
 			// 1. Ping le serveur central (IPv4 et v6 si dispo)
 			// On force la ré-résolution pour gérer le changement d'IP DNS éventuel
 			if addr, err := net.ResolveUDPAddr("udp", protocol.GetServerUDPv6()); err == nil {
 				SendPing(s.Conn, addr)
+				time.Sleep(1 * time.Microsecond) // Délai pour garantir un ID unique
 			}
 			if addr, err := net.ResolveUDPAddr("udp", protocol.GetServerUDPv4()); err == nil {
 				SendPing(s.Conn, addr)
+				time.Sleep(1 * time.Microsecond)
 			}
 
 			// 2. Ping tous les pairs connectés (toutes leurs adresses)
@@ -453,6 +481,7 @@ func (s *Server) KeepAlive(serverAddr *net.UDPAddr, interval time.Duration, ctx 
 				if peerInfo, ok := s.PeerManager.Get(peerName); ok && peerInfo.Name != "jch.irif.fr" {
 					for _, addr := range peerInfo.Addrs {
 						SendPing(s.Conn, addr)
+						time.Sleep(1 * time.Microsecond)
 					}
 				}
 			}
