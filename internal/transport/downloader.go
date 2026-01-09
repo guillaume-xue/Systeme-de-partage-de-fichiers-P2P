@@ -30,6 +30,8 @@ type Downloader struct {
 
 	// Stats de progression
 	totalReceived int
+	successCount  int // Compteur de succès consécutifs
+	failureCount  int // Compteur d'échecs récents
 	statsMu       sync.Mutex
 
 	// Communication interne
@@ -108,6 +110,7 @@ func (d *Downloader) DownloadTree(rootHash [32]byte) {
 
 		d.mu.Lock()
 		inflight := len(d.pending)
+		windowSize := d.windowSize
 		d.mu.Unlock()
 
 		queued := len(d.workCh)
@@ -116,14 +119,16 @@ func (d *Downloader) DownloadTree(rootHash [32]byte) {
 		received := d.totalReceived
 		d.statsMu.Unlock()
 
-		// Affichage de progression
-		fmt.Printf("\r📊 Progression: %d reçus | En cours: %d | File d'attente: %d | Fenêtre: %d",
-			received, inflight, queued, d.windowSize)
+		// Affichage de progression - nettoyer la ligne d'abord
+		fmt.Printf("\r%-100s\r", "") // Nettoyer avec 100 espaces
+		fmt.Printf("📊 Progression: %d reçus | En cours: %d | File d'attente: %d | Fenêtre: %d",
+			received, inflight, queued, windowSize)
 
 		if inflight == 0 && queued == 0 {
 			// Petite sécurité supplémentaire
 			time.Sleep(100 * time.Millisecond)
 			if len(d.pending) == 0 && len(d.workCh) == 0 {
+				fmt.Println() // Retour à la ligne final
 				break
 			}
 		}
@@ -196,11 +201,13 @@ func (d *Downloader) responseLoop() {
 		d.mu.Lock()
 		sentAt, ok := d.pending[hash]
 		if ok {
-			// Calcul pour ajuster fenêtre
-			if time.Since(sentAt) < d.timeout/2 {
-				if d.windowSize < d.maxWindowSize {
-					d.windowSize++
-				}
+			// Succès ! Incrémenter le compteur
+			d.successCount++
+			d.failureCount = 0 // Reset les échecs
+
+			// Augmenter la fenêtre seulement si réponse rapide
+			if time.Since(sentAt) < d.timeout/2 && d.windowSize < d.maxWindowSize {
+				d.windowSize++
 			}
 			delete(d.pending, hash)
 			delete(d.retries, hash)
@@ -248,9 +255,18 @@ func (d *Downloader) timeoutLoop() {
 			}
 		}
 
-		// Si on a des timeouts, on réduit la fenêtre (Congestion)
+		// Ajuster la fenêtre seulement si taux d'échec significatif
 		if len(retryList) > 0 {
-			d.windowSize = utils.MaxInt(d.windowSize/2, d.minWindowSize)
+			d.failureCount += len(retryList)
+			d.successCount = 0 // Reset succès après échec
+
+			// Diminuer la fenêtre seulement si échecs répétés
+			if d.failureCount > 2 && d.windowSize > d.minWindowSize {
+				// Réduction standard : -40% (TCP-like)
+				newWindow := (d.windowSize * 3) / 5
+				d.windowSize = utils.MaxInt(newWindow, d.minWindowSize)
+				d.failureCount = 0 // Reset après ajustement
+			}
 		}
 		d.mu.Unlock()
 

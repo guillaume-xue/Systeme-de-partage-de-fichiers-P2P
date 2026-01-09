@@ -6,6 +6,7 @@ import (
 	"main/internal/config"
 	"main/internal/merkle"
 	"main/internal/peer"
+	"main/internal/protocol"
 	"main/internal/transport"
 	"main/internal/utils"
 	"net"
@@ -52,6 +53,7 @@ func (m *InteractiveMenu) Run() {
 		fmt.Println("4. Télécharger un fichier")
 		fmt.Println("5. État des connexions")
 		fmt.Println("6. Mes fichiers")
+		fmt.Println("7. Activer le mode debug (afficher les datums)")
 		fmt.Println("0. Quitter")
 
 		choice := m.ask("\n> Choix : ")
@@ -69,6 +71,9 @@ func (m *InteractiveMenu) Run() {
 			m.showConnections()
 		case "6":
 			m.showLocalFiles()
+		case "7":
+			protocol.Debug_Enable = !protocol.Debug_Enable
+			fmt.Printf("🔧 Mode debug (affichage datums) : %v\n", protocol.Debug_Enable)
 		case "0", "q":
 			m.server.Stop()
 			return
@@ -112,22 +117,7 @@ func (m *InteractiveMenu) connectToPeer() {
 	}
 
 	// Parser et résoudre les adresses
-	var targets []*net.UDPAddr
-	lines := strings.SplitSeq(rawAddr, "\n")
-	for addrLine := range lines {
-		addrLine = strings.TrimSpace(addrLine)
-		if addrLine == "" {
-			continue
-		}
-		if resolvedAddr, err := net.ResolveUDPAddr("udp", addrLine); err == nil {
-			targets = append(targets, resolvedAddr)
-			ipVersion := "IPv4"
-			if resolvedAddr.IP.To4() == nil {
-				ipVersion = "IPv6"
-			}
-			fmt.Printf("-> Trouvé: %s [%s]\n", addrLine, ipVersion)
-		}
-	}
+	targets := utils.AddrParserSolver(rawAddr)
 	if len(targets) == 0 {
 		fmt.Println("Pas d'adresses valides trouvées.")
 		return
@@ -400,7 +390,7 @@ func (m *InteractiveMenu) sendNatTraversalViaPeer(targetAddresses []*net.UDPAddr
 		}
 
 		// Tester avec pingSpam
-		if m.pingSpam(targetIPv6, pName, 5, responseChan) {
+		if m.pingSpam(targetIPv6, pName, 3, responseChan) {
 			fmt.Println("✅ NAT traversal réussi via IPv6")
 			return true, targetIPv6
 		}
@@ -417,7 +407,7 @@ func (m *InteractiveMenu) sendNatTraversalViaPeer(targetAddresses []*net.UDPAddr
 		}
 
 		// Tester avec pingSpam
-		if m.pingSpam(targetIPv4, pName, 5, responseChan) {
+		if m.pingSpam(targetIPv4, pName, 3, responseChan) {
 			fmt.Println("✅ NAT traversal réussi via IPv4")
 			return true, targetIPv4
 		}
@@ -426,8 +416,9 @@ func (m *InteractiveMenu) sendNatTraversalViaPeer(targetAddresses []*net.UDPAddr
 	return false, nil
 }
 
-// pingSpam envoie plusieurs pings pour percer le NAT
+// pingSpam envoie plusieurs pings pour percer le NAT avec backoff exponentiel
 // Retourne true dès réception d'un ping du pair ou d'un OK en réponse
+// Utilise un backoff exponentiel : 0s, 1s, 2s, 4s, 8s, etc.
 func (m *InteractiveMenu) pingSpam(addresses []*net.UDPAddr, _ string, count int, responseChan chan *net.UDPAddr) bool {
 	// Créer une map des adresses cibles pour vérification rapide
 	targetAddrs := make(map[string]bool)
@@ -438,7 +429,18 @@ func (m *InteractiveMenu) pingSpam(addresses []*net.UDPAddr, _ string, count int
 	// Canal pour signaler l'arrêt
 	stopSending := make(chan bool)
 
-	// Démarrer la surveillance IMMÉDIATEMENT
+	// Calculer le timeout total basé sur le backoff exponentiel
+	// count=5 → 0 + 1 + 2 + 4 + 8 = 15 secondes + marge
+	totalTimeout := time.Duration(0)
+	for i := range count {
+		if i == 0 {
+			// Premier envoi immédiat
+			continue
+		}
+		totalTimeout += time.Duration(1<<uint(i-1)) * time.Second
+	}
+
+	// Démarrer la surveillance
 	pierced := make(chan bool, 1)
 	go func() {
 		for {
@@ -453,7 +455,7 @@ func (m *InteractiveMenu) pingSpam(addresses []*net.UDPAddr, _ string, count int
 					}
 					return
 				}
-			case <-time.After(time.Duration(count*100+1000) * time.Millisecond):
+			case <-time.After(totalTimeout):
 				select {
 				case pierced <- false:
 				default:
@@ -463,9 +465,6 @@ func (m *InteractiveMenu) pingSpam(addresses []*net.UDPAddr, _ string, count int
 		}
 	}()
 
-	// Petit délai initial pour laisser le temps au pair distant d'envoyer
-	time.Sleep(200 * time.Millisecond)
-
 	// Vérifier si on a déjà reçu quelque chose
 	select {
 	case result := <-pierced:
@@ -474,8 +473,8 @@ func (m *InteractiveMenu) pingSpam(addresses []*net.UDPAddr, _ string, count int
 		// Continuer avec l'envoi de pings
 	}
 
-	// Envoyer les pings
-	for range count {
+	// Envoyer les pings avec backoff exponentiel
+	for i := range count {
 		select {
 		case <-stopSending:
 			// Réception détectée, on arrête d'envoyer
@@ -486,7 +485,25 @@ func (m *InteractiveMenu) pingSpam(addresses []*net.UDPAddr, _ string, count int
 			for _, addr := range addresses {
 				transport.SendPing(m.server.Conn, addr)
 			}
-			time.Sleep(100 * time.Millisecond)
+
+			// Attendre avec backoff exponentiel
+			if i < count-1 { // Pas d'attente après le dernier envoi
+				var waitTime time.Duration
+				if i == 0 {
+					waitTime = 1 * time.Second
+				} else {
+					waitTime = time.Duration(1<<uint(i)) * time.Second
+				}
+
+				// Attendre avec possibilité d'interruption
+				select {
+				case <-stopSending:
+					result := <-pierced
+					return result
+				case <-time.After(waitTime):
+					// Continuer à la prochaine itération
+				}
+			}
 		}
 	}
 

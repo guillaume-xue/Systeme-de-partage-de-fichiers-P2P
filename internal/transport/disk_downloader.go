@@ -55,10 +55,11 @@ type DiskDownloader struct {
 	cacheMu sync.RWMutex
 
 	// Stats
-	savedFiles    int
-	savedBytes    int64
-	totalReceived int
-	statsMu       sync.Mutex
+	savedFiles   int
+	savedBytes   int64
+	successCount int // Compteur de succès consécutifs
+	failureCount int // Compteur d'échecs récents
+	statsMu      sync.Mutex
 
 	// Lifecycle
 	wg          sync.WaitGroup
@@ -157,18 +158,21 @@ func (d *DiskDownloader) waitFinish() {
 		queuedCount := len(d.workQueue)
 
 		d.statsMu.Lock()
-		received := d.totalReceived
+		savedFiles := d.savedFiles
+		savedBytes := d.savedBytes
 		d.statsMu.Unlock()
 
-		// Affichage de progression
-		fmt.Printf("\r💾 Téléchargement: %d reçus (%d fichiers, %s) | En cours: %d | File: %d | Fenêtre: %d",
-			received, d.savedFiles, utils.FormatBytesInt64(d.savedBytes), inflightCount, queuedCount, windowSize)
+		// Affichage de progression - nettoyer la ligne d'abord
+		fmt.Printf("\r%-100s\r", "") // Nettoyer avec 100 espaces
+		fmt.Printf("💾 Téléchargement: (%d fichiers, %s) | En cours: %d | File: %d | Fenêtre: %d",
+			savedFiles, utils.FormatBytesInt64(savedBytes), inflightCount, queuedCount, windowSize)
 
 		// Si plus rien en cours, plus rien dans la queue, on suppose que c'est fini
 		if inflightCount == 0 && queuedCount == 0 {
 			// Petite pause de sécurité pour être sûr qu'un process en cours n'ajoute pas un truc
 			time.Sleep(500 * time.Millisecond)
 			if len(d.inflight) == 0 && len(d.workQueue) == 0 {
+				fmt.Println() // Retour à la ligne final
 				break
 			}
 		}
@@ -259,20 +263,19 @@ func (d *DiskDownloader) processorLoop() {
 	defer d.wg.Done()
 
 	for hash := range d.responseCh {
-		// Incrémenter les stats
-		d.statsMu.Lock()
-		d.totalReceived++
-		d.statsMu.Unlock()
-
 		d.pendingMu.Lock()
 		start, ok := d.inflight[hash]
 		if ok {
-			// Calcul pour ajuster fenêtre
-			if time.Since(start) < d.timeout/2 {
-				if d.window < d.maxWindow {
-					d.window++
-				}
+			// Incrémenter le compteur de succès
+			d.successCount++
+			d.failureCount = 0 // Reset les échecs
+
+			// Augmenter la fenêtre seulement si réponse rapide
+			// Si réponse lente, on est proche de la limite -> ne pas augmenter
+			if time.Since(start) < d.timeout/2 && d.window < d.maxWindow {
+				d.window++
 			}
+
 			delete(d.inflight, hash)
 			delete(d.retries, hash) // Reset retry count
 		}
@@ -294,26 +297,47 @@ func (d *DiskDownloader) monitorLoop() {
 		now := time.Now()
 
 		d.pendingMu.Lock()
+		timeoutCount := 0
+		var retryList [][32]byte
 		for hash, sentAt := range d.inflight {
 			if now.Sub(sentAt) > d.timeout {
+				timeoutCount++
 				// Timeout !
 				d.retries[hash]++
 				if d.retries[hash] > 5 {
 					// Trop d'échecs, on abandonne ce chunk
 					fmt.Printf("⚠️ Give up on %x\n", hash)
 					delete(d.inflight, hash)
+					delete(d.retries, hash)
 				} else {
-					// Retry
+					// Retry - ajouter à la liste pour renvoyer après avoir relâché le lock
+					retryList = append(retryList, hash)
 					d.inflight[hash] = now // Reset timer
-					// Congestion control: on divise la fenêtre par 2
-					d.window = utils.MaxInt(d.window/2, d.minWindow)
-
-					// Renvoi
-					go SendDatumRequest(d.server.Conn, d.peer, hash)
 				}
 			}
 		}
+
+		// Ajuster la fenêtre seulement si taux d'échec significatif
+		// Ne pas pénaliser pour quelques timeouts isolés
+		if timeoutCount > 0 {
+			d.failureCount += timeoutCount
+			d.successCount = 0 // Reset succès après échec
+
+			// Diminuer la fenêtre seulement si échecs répétés
+			// Seuil à 2 pour réagir plus vite
+			if d.failureCount > 2 && d.window > d.minWindow {
+				newWindow := (d.window * 3) / 5 // Réduction à 60%
+				d.window = utils.MaxInt(newWindow, d.minWindow)
+				d.failureCount = 0 // Reset après ajustement
+			}
+		}
+
 		d.pendingMu.Unlock()
+
+		// Retransmission
+		for _, hash := range retryList {
+			SendDatumRequest(d.server.Conn, d.peer, hash)
+		}
 	}
 }
 

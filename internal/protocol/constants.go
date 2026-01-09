@@ -23,6 +23,10 @@ const (
 	NatTraversalRequest2 = 5
 )
 
+var (
+	Debug_Enable = false
+)
+
 // Helpers pour accéder à la config au cas où json a un problème
 func GetURL() string {
 	if config.GlobalConfig != nil {

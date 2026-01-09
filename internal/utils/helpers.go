@@ -6,6 +6,7 @@ import (
 	"main/internal/protocol"
 	"net"
 	"strings"
+	"time"
 )
 
 // Formate une taille en bytes de façon lisible (int64 au cas où si très gros fichiers)
@@ -74,7 +75,6 @@ func DetectLocalIPProtocol() (hasIPv4 bool, hasIPv6 bool) {
 	return hasIPv4, hasIPv6
 }
 
-
 func FiltrerAddressesByProtocol(filteredTargets, filteredRelayAddrs []*net.UDPAddr) (bool, []*net.UDPAddr, []*net.UDPAddr, []*net.UDPAddr, []*net.UDPAddr) {
 
 	// Séparer les adresses par protocole
@@ -105,4 +105,31 @@ func FiltrerAddressesByProtocol(filteredTargets, filteredRelayAddrs []*net.UDPAd
 	}
 
 	return true, targetIPv4, targetIPv6, relayIPv4, relayIPv6
+}
+
+func AddrParserSolver(rawAddr string) (targets []*net.UDPAddr) {
+	lines := strings.SplitSeq(rawAddr, "\n")
+	for addrLine := range lines {
+		addrLine = strings.TrimSpace(addrLine)
+		if addrLine == "" {
+			continue
+		}
+		if resolvedAddr, err := net.ResolveUDPAddr("udp", addrLine); err == nil {
+			targets = append(targets, resolvedAddr)
+			ipVersion := "IPv4"
+			if resolvedAddr.IP.To4() == nil {
+				ipVersion = "IPv6"
+			}
+			fmt.Printf("-> Trouvé: %s [%s]\n", addrLine, ipVersion)
+		}
+	}
+	return targets
+}
+
+func CalExpo2Time(count int) time.Duration {
+	totalTimeout := time.Duration(0)
+	for i := 1; i < count; i++ {
+		totalTimeout += time.Duration(1<<uint(i-1)) * time.Second
+	}
+	return totalTimeout
 }

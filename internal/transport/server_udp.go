@@ -9,6 +9,7 @@ import (
 	"main/internal/merkle"
 	"main/internal/peer"
 	"main/internal/protocol"
+	"main/internal/utils"
 	"net"
 	"sync"
 	"time"
@@ -98,8 +99,13 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 	// Log de la réception
 	typeName := protocol.GetTypeName(pkt.Header.Type)
 	// Juste pour éviter les spams de datum
-	if pkt.Header.Type != protocol.Datum {
+	if (pkt.Header.Type != protocol.Datum) || protocol.Debug_Enable {
 		fmt.Printf("📥 Réception %s ← %s (ID: %d)\n", typeName, addr, pkt.Header.ID)
+		if pkt.Header.Type == protocol.Datum {
+			fmt.Printf("    Header: %+v\n", pkt.Header)
+			fmt.Printf("    Body: %x\n", pkt.Body)
+			fmt.Printf("    Signature: %x\n", pkt.Signature)
+		}
 	}
 
 	// Notifier les listeners de pingSpam qu'on a reçu quelque chose
@@ -370,20 +376,27 @@ func (s *Server) onNatRequest2(pkt *protocol.Packet, relayAddr *net.UDPAddr) {
 		s.PingResponseMu.Unlock()
 	}()
 
+	// Calculer le timeout total avec backoff exponentiel
+	count := 3
+	totalTimeout := utils.CalExpo2Time(count)
+
 	// Canal pour détecter le succès
 	success := make(chan bool, 1)
+	stopSending := make(chan bool)
+
 	go func() {
 		for {
 			select {
 			case receivedAddr := <-responseChan:
 				if receivedAddr.String() == srcAddr.String() {
+					close(stopSending) // Signaler l'arrêt
 					select {
 					case success <- true:
 					default:
 					}
 					return
 				}
-			case <-time.After(1 * time.Second):
+			case <-time.After(totalTimeout):
 				select {
 				case success <- false:
 				default:
@@ -393,22 +406,48 @@ func (s *Server) onNatRequest2(pkt *protocol.Packet, relayAddr *net.UDPAddr) {
 		}
 	}()
 
-	// Envoyer des pings jusqu'à réponse ou timeout
-	for range 5 {
+	// Envoyer des pings avec backoff exponentiel
+	for i := range count {
 		select {
-		case <-success:
-			return // Succès, on arrête
+		case <-stopSending:
+			// Succès détecté, on arrête immédiatement
+			<-success
+			fmt.Printf("✅ NAT traversal réussi avec %s\n", srcAddr)
+			return
 		default:
 			SendPing(s.Conn, srcAddr)
-			time.Sleep(100 * time.Millisecond)
+
+			// Attendre avec backoff exponentiel (sauf après le dernier ping)
+			if i < count-1 {
+				var waitTime time.Duration
+				if i == 0 {
+					waitTime = 1 * time.Second
+				} else {
+					waitTime = time.Duration(1<<uint(i)) * time.Second
+				}
+
+				// Attendre avec possibilité d'interruption
+				select {
+				case <-stopSending:
+					<-success
+					fmt.Printf("✅ NAT traversal réussi avec %s\n", srcAddr)
+					return
+				case <-time.After(waitTime):
+					// Continuer à la prochaine itération
+				}
+			}
 		}
 	}
 
 	// Attendre le résultat final
 	select {
-	case <-success:
-		return
-	case <-time.After(200 * time.Millisecond):
+	case result := <-success:
+		if result {
+			fmt.Printf("✅ NAT traversal réussi avec %s\n", srcAddr)
+		} else {
+			fmt.Printf("⏱️ Timeout NAT avec %s\n", srcAddr)
+		}
+	case <-time.After(500 * time.Millisecond):
 		fmt.Printf("⏱️ Timeout NAT avec %s\n", srcAddr)
 	}
 }

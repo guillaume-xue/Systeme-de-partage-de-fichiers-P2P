@@ -45,7 +45,7 @@ func sendRaw(conn *net.UDPConn, dest *net.UDPAddr, typ uint8, body []byte, key *
 	// 6. Log de l'envoi
 	typeName := protocol.GetTypeName(typ)
 	// Pour éviter les spams de datum
-	if typ != protocol.DatumRequest {
+	if typ != protocol.DatumRequest || protocol.Debug_Enable {
 		fmt.Printf("📤 Envoi %s → %s (ID: %d)\n", typeName, dest, id)
 	}
 
