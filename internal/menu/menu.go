@@ -221,7 +221,7 @@ func (m *InteractiveMenu) downloadManual(ctx context.Context) {
 		targetHash = parsedHash
 	}
 	// Gestion Ctrl+C
-	dlCtx, cancel := context.WithTimeout(ctx, 3 * time.Minute)
+	dlCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
 	destDir := filepath.Join("downloads", utils.CleanName(pName))

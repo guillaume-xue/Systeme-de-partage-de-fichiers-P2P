@@ -14,7 +14,8 @@
     "max_window_size": 256,
     "initial_window": 10,
     "min_window_size": 2,
-    "timeout_seconds_download": 1
+    "timeout_seconds_download": 1,
+    "processor_workers": 20
   },
   "merkle": {
     "max_chunk_size": 1024,

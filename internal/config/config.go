@@ -36,6 +36,7 @@ type NetworkConfig struct {
 	MinWindowSize          int           `json:"min_window_size"`
 	TimeoutDownload        time.Duration `json:"-"` // Géré via TimeoutSecondsDownload
 	TimeoutSecondsDownload int           `json:"timeout_seconds_download"`
+	ProcessorWorkers       int           `json:"processor_workers"`
 }
 
 type MerkleConfig struct {

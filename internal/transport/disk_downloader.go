@@ -69,6 +69,9 @@ type DiskDownloader struct {
 	running     bool
 	// Channel pour signaler la fin
 	done chan struct{}
+
+	// Semaphore pour limiter les goroutines de processing
+	processorSem chan struct{}
 }
 
 func NewDiskDownloader(server *Server, peer *net.UDPAddr, output string) *DiskDownloader {
@@ -98,8 +101,9 @@ func NewDiskDownloader(server *Server, peer *net.UDPAddr, output string) *DiskDo
 		bigFiles:       make(map[[32]byte]string),
 		structureCache: make(map[[32]byte][]byte),
 
-		running: true,
-		done:    make(chan struct{}),
+		running:      true,
+		done:         make(chan struct{}),
+		processorSem: make(chan struct{}, config.GlobalConfig.Network.ProcessorWorkers),
 	}
 }
 
@@ -118,14 +122,18 @@ func (d *DiskDownloader) DownloadToDisk(ctx context.Context, rootHash [32]byte) 
 	subID := fmt.Sprintf("dl_%d", rootHash)
 	d.unsubscribe = d.server.DatumDispatcher.Subscribe(subID, d.onDatumReceived)
 
+	fmt.Printf("📥 Start DL -> %s (Root: %x...)\n", d.outputDir, rootHash)
+
 	// 3. Démarrage workers
 	d.wg.Add(3)
 	go d.senderLoop()
 	go d.processorLoop()
 	go d.monitorLoop()
 
-	fmt.Printf("📥 Start DL -> %s (Root: %x...)\n", d.outputDir, rootHash)
-
+	// 4. On lance la machine avec la première tâche
+	d.workQueue <- task{hash: rootHash, path: "__ROOT__"} // Marker spécial, utile pour différencier root ou autre
+	// d.printStats()
+	// 5. Attente passive
 	select {
 	case <-d.done:
 	case <-ctx.Done():
@@ -133,12 +141,6 @@ func (d *DiskDownloader) DownloadToDisk(ctx context.Context, rootHash [32]byte) 
 		os.RemoveAll(d.tempDir)
 		return ctx.Err()
 	}
-
-	// 4. On lance la machine
-	d.workQueue <- task{hash: rootHash, path: "__ROOT__"} // Marker spécial, utile pour différencier root ou autre
-
-	// 5. Attente passive
-	<-d.done
 
 	// 6. Reconstruction finale (Assemblage des gros fichiers)
 	d.finalizeBigFiles()
@@ -166,6 +168,22 @@ func (d *DiskDownloader) stop() {
 
 // Callback UDP
 func (d *DiskDownloader) onDatumReceived(hash [32]byte, data []byte) {
+	// retirer de inflight tds pour éviter les faux timeouts
+	d.pendingMu.Lock()
+	start, wasInflight := d.inflight[hash]
+	if wasInflight {
+		d.successCount++
+		d.failureCount = 0
+
+		// Augmenter la fenêtre seulement si réponse rapide
+		if time.Since(start) < d.timeout/2 && d.window < d.maxWindow {
+			d.window++
+		}
+		delete(d.inflight, hash)
+		delete(d.retries, hash)
+	}
+	d.pendingMu.Unlock()
+
 	// On détermine si c'est un Chunk (Data) ou une Structure (Node)
 	typ, _ := merkle.ParseDatum(data)
 
@@ -276,23 +294,21 @@ func (d *DiskDownloader) getPath(hash [32]byte) string {
 func (d *DiskDownloader) processorLoop() {
 	defer d.wg.Done()
 	for hash := range d.responseCh {
-		d.pendingMu.Lock()
-		start, ok := d.inflight[hash]
-		if ok {
-			d.successCount++
-			d.failureCount = 0
+		// Acquérir le semaphore (ou attendre qu'un slot se libère)
+		d.processorSem <- struct{}{}
 
-			// Augmenter la fenêtre seulement si réponse rapide
-			// Si réponse lente, on est proche de la limite -> ne pas augmenter
-			if time.Since(start) < d.timeout/2 && d.window < d.maxWindow {
-				d.window++
-			}
-			delete(d.inflight, hash)
-			delete(d.retries, hash) // Reset retry count
-		}
-		d.pendingMu.Unlock()
-		path := d.getPath(hash) // Récup le path sauvegardé
-		d.processDatum(hash, path)
+		// Traiter en parallèle
+		go func(h [32]byte) {
+			defer func() { <-d.processorSem }() // Libérer le semaphore
+
+			path := d.getPath(h)
+			d.processDatum(h, path)
+		}(hash)
+	}
+
+	// Attendre que tous les processing en cours se terminent
+	for i := 0; i < cap(d.processorSem); i++ {
+		d.processorSem <- struct{}{}
 	}
 }
 
@@ -308,6 +324,20 @@ func (d *DiskDownloader) monitorLoop() {
 		d.pendingMu.Lock()
 		inflightCount := len(d.inflight)
 		queuedCount := len(d.workQueue)
+		windowSize := d.window
+		d.pendingMu.Unlock()
+
+		// Affichage des stats
+		d.statsMu.Lock()
+		savedFiles := d.savedFiles
+		savedBytes := d.savedBytes
+		d.statsMu.Unlock()
+
+		fmt.Printf("\r%-100s\r", "") // Nettoyer la ligne
+		fmt.Printf("💾 Téléchargement: (%d fichiers, %s) | En cours: %d | File: %d | Fenêtre: %d",
+			savedFiles, utils.FormatBytesInt64(savedBytes), inflightCount, queuedCount, windowSize)
+
+		d.pendingMu.Lock()
 
 		// Logique de fin
 		if inflightCount == 0 && queuedCount == 0 {
@@ -316,6 +346,7 @@ func (d *DiskDownloader) monitorLoop() {
 			time.Sleep(200 * time.Millisecond)
 			d.pendingMu.Lock()
 			if len(d.inflight) == 0 && len(d.workQueue) == 0 {
+				fmt.Println()
 				d.pendingMu.Unlock()
 				close(d.done)
 				return
@@ -333,7 +364,7 @@ func (d *DiskDownloader) monitorLoop() {
 				d.retries[hash]++
 				if d.retries[hash] > 3 {
 					// Trop d'échecs, on abandonne ce chunk
-					fmt.Printf("⚠️ Abandon définitif chunk %x\n", hash)
+					fmt.Printf("\n⚠️ Abandon définitif chunk %x\n", hash)
 					delete(d.inflight, hash)
 					delete(d.retries, hash)
 				} else {
@@ -508,7 +539,7 @@ func (d *DiskDownloader) assembleStream(hash [32]byte, writer io.Writer) (int64,
 	chunkPath := filepath.Join(d.tempDir, fmt.Sprintf("%x", hash))
 	chunkData, err := os.ReadFile(chunkPath)
 	if err != nil {
-		return 0, fmt.Errorf("chunk manquant: %x", hash[:8])
+		return 0, fmt.Errorf("chunk manquant: %x", hash)
 	}
 
 	_, content := merkle.ParseDatum(chunkData)
