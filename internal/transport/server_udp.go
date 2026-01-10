@@ -39,6 +39,8 @@ type Server struct {
 	keyCache   map[string][]byte
 	keyCacheMu sync.RWMutex
 
+	workerSem chan struct{}
+
 	shutdown chan struct{}
 }
 
@@ -52,6 +54,7 @@ func NewServer(conn *net.UDPConn, key *ecdsa.PrivateKey, name string) *Server {
 		Downloads:       merkle.NewStore(),
 		DatumDispatcher: NewDatumDispatcher(),
 		keyCache:        make(map[string][]byte),
+		workerSem:       make(chan struct{}, 100), // Limite à 100 workers concurrents
 		shutdown:        make(chan struct{}),
 	}
 }
@@ -61,24 +64,25 @@ func (s *Server) ListenLoop(ctx context.Context) {
 	buf := make([]byte, 65535) // max buffer
 
 	for {
+		n, remote, err := s.Conn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+
+		// Copie nécessaire car buf est écrasé à la prochaine itération
+		packetData := make([]byte, n)
+		copy(packetData, buf[:n])
+
 		select {
+		case s.workerSem <- struct{}{}:
+			go func() {
+				defer func() { <-s.workerSem }() // Libérer le semaphore
+				s.handlePacket(remote, packetData)
+			}()
 		case <-ctx.Done():
 			return
 		case <-s.shutdown:
 			return
-		default:
-			// ReadFromUDP est bloquant, on compte sur le SetReadDeadline ou la fermeture du socket
-			n, remote, err := s.Conn.ReadFromUDP(buf)
-			if err != nil {
-				continue
-			}
-
-			// Copie nécessaire car buf est écrasé à la prochaine itération
-			packetData := make([]byte, n)
-			copy(packetData, buf[:n])
-
-			// Traitement asynchrone pour ne pas bloquer la boucle d'écoute
-			go s.handlePacket(remote, packetData)
 		}
 	}
 }
@@ -119,7 +123,7 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 	s.PingResponseMu.Unlock()
 
 	if p, ok := s.PeerManager.GetByAddr(addr); ok {
-		s.PeerManager.AddOrUpdate(p.Name, addr, p.PublicKey)
+		s.PeerManager.AddOrUpdate(p.Name, addr, p.PublicKey, p.IsRelay)
 	}
 
 	// Dispatch selon le type
@@ -200,7 +204,7 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 // --- Handlers Spécifiques ---
 
 func (s *Server) onHello(pkt *protocol.Packet, addr *net.UDPAddr, isReply bool) {
-	_, name, err := protocol.DecodeHelloBody(pkt.Body)
+	extensions, name, err := protocol.DecodeHelloBody(pkt.Body)
 	if err != nil {
 		fmt.Printf("❌ Erreur décodage Hello de %s\n", addr)
 		return
@@ -220,8 +224,10 @@ func (s *Server) onHello(pkt *protocol.Packet, addr *net.UDPAddr, isReply bool) 
 		return
 	}
 
+	isRelay := (extensions & protocol.ExtNatTraversalRelay) != 0
+
 	// 3. Enregistrement
-	s.PeerManager.AddOrUpdate(name, addr, pubKey)
+	s.PeerManager.AddOrUpdate(name, addr, pubKey, isRelay)
 
 	if isReply {
 		fmt.Printf("✅ Connecté à %s (%s)\n", name, addr)

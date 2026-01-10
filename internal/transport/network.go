@@ -96,33 +96,41 @@ func TryConnectWithFallback(name string, privKey *ecdsa.PrivateKey) (*net.UDPCon
 
 // waitResponse attend un paquet spécifique pendant 2 secondes
 func waitResponse(conn *net.UDPConn, expectedID uint32) bool {
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	deadline := time.Now().Add(2 * time.Second)
+	conn.SetReadDeadline(deadline)
 	defer conn.SetReadDeadline(time.Time{})
 
 	buf := make([]byte, 2048)
 
-	// On essaie quelques fois au cas où on reçoit des paquets parasites
-	for range 5 {
+	for {
+		// On calcule le temps restant
+		if time.Now().After(deadline) {
+			return false // Timeout écoulé
+		}
+
 		n, _, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			return false
+			// Si c'est une erreur de timeout réseau, on arrête
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				return false
+			}
+			continue
 		}
 
 		if n < 5 {
 			continue
-		} // Trop court
+		}
 
-		// On gère le cas où on se reconnecte avait d'être retiré de la liste des peers
-		// On ne décode pas tout le paquet, juste l'ID pour voir si c'est notre réponse
+		// Lecture rapide de l'en-tête (BigEndian Uint32)
 		rcvID := binary.BigEndian.Uint32(buf[0:4])
 		msgType := buf[4]
 
 		if rcvID == expectedID {
-			// On accepte HelloReply (130), Ok (128) ou Ping (0)
+			// On accepte les types de réponse valides
 			return msgType == protocol.HelloReply || msgType == protocol.Ok || msgType == protocol.Ping
 		}
+		// Si ce n'est pas le bon ID, on boucle et on réessaie (tant que le temps n'est pas écoulé)
 	}
-	return false
 }
 
 func GetNetworkMode() string {

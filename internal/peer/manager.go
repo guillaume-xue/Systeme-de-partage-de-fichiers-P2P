@@ -13,6 +13,7 @@ type PeerInfo struct {
 	Addrs     []*net.UDPAddr // Support IPv4 et IPv6
 	PublicKey *ecdsa.PublicKey
 	LastSeen  time.Time
+	IsRelay   bool
 }
 
 // GetAddr retourne la première adresse (pour compatibilité)
@@ -36,17 +37,20 @@ func NewPeerManager() *PeerManager {
 }
 
 // AddOrUpdate : Heartbeat ou nouvelle connexion
-func (pm *PeerManager) AddOrUpdate(name string, addr *net.UDPAddr, pubKey *ecdsa.PublicKey) {
+func (pm *PeerManager) AddOrUpdate(name string, addr *net.UDPAddr, pubKey *ecdsa.PublicKey, isRelay bool) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
 	if peer, exists := pm.peers[name]; exists {
 		peer.LastSeen = time.Now()
+		peer.IsRelay = isRelay
 		// Ajouter l'adresse si elle n'existe pas déjà
-		addrStr := addr.String()
 		found := false
 		for _, existingAddr := range peer.Addrs {
-			if existingAddr.String() == addrStr {
+			if existingAddr.Port != addr.Port {
+				continue
+			}
+			if existingAddr.IP.Equal(addr.IP) {
 				found = true
 				break
 			}
@@ -61,6 +65,7 @@ func (pm *PeerManager) AddOrUpdate(name string, addr *net.UDPAddr, pubKey *ecdsa
 			Addrs:     []*net.UDPAddr{addr},
 			PublicKey: pubKey,
 			LastSeen:  time.Now(),
+			IsRelay:   isRelay,
 		}
 	}
 }
@@ -78,10 +83,12 @@ func (pm *PeerManager) GetByAddr(addr *net.UDPAddr) (*PeerInfo, bool) {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 
-	target := addr.String()
 	for _, peer := range pm.peers {
 		for _, peerAddr := range peer.Addrs {
-			if peerAddr.String() == target {
+			if peerAddr.Port != addr.Port {
+				continue
+			}
+			if peerAddr.IP.Equal(addr.IP) {
 				return peer, true
 			}
 		}

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"main/internal/config"
 	"main/internal/merkle"
+	"main/internal/protocol"
 	"main/internal/utils"
 	"net"
 	"sync"
@@ -38,6 +39,8 @@ type Downloader struct {
 	workCh     chan [32]byte // File d'attente des hash à demander
 	responseCh chan [32]byte // Signal de réception
 
+	done chan struct{}
+
 	// Contrôle
 	running     bool
 	wg          sync.WaitGroup
@@ -58,9 +61,10 @@ func NewDownloader(server *Server, peerAddr *net.UDPAddr) *Downloader {
 		retries: make(map[[32]byte]int),
 
 		// Buffer large pour ne pas bloquer l'exploration récursive
-		workCh:     make(chan [32]byte, 10000),
-		responseCh: make(chan [32]byte, 100),
+		workCh:     make(chan [32]byte, protocol.MaxQueueSize),
+		responseCh: make(chan [32]byte, protocol.MaxQueueSize),
 
+		done:    make(chan struct{}),
 		running: true,
 	}
 }
@@ -73,7 +77,7 @@ func (d *Downloader) Start() {
 	d.wg.Add(3)
 	go d.senderLoop()
 	go d.responseLoop()
-	go d.timeoutLoop()
+	go d.monitorLoop()
 }
 
 // Stop nettoie tout
@@ -99,40 +103,7 @@ func (d *Downloader) DownloadTree(rootHash [32]byte) {
 
 	// On injecte la racine
 	d.workCh <- rootHash
-
-	// Boucle d'attente active ("Surcharge wait" avec sleep)
-	// Tant qu'il y a des trucs en cours ou dans la file, on attend.
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		<-ticker.C
-
-		d.mu.Lock()
-		inflight := len(d.pending)
-		windowSize := d.windowSize
-		d.mu.Unlock()
-
-		queued := len(d.workCh)
-
-		d.statsMu.Lock()
-		received := d.totalReceived
-		d.statsMu.Unlock()
-
-		// Affichage de progression - nettoyer la ligne d'abord
-		fmt.Printf("\r%-100s\r", "") // Nettoyer avec 100 espaces
-		fmt.Printf("📊 Progression: %d reçus | En cours: %d | File d'attente: %d | Fenêtre: %d",
-			received, inflight, queued, windowSize)
-
-		if inflight == 0 && queued == 0 {
-			// Petite sécurité supplémentaire
-			time.Sleep(100 * time.Millisecond)
-			if len(d.pending) == 0 && len(d.workCh) == 0 {
-				fmt.Println() // Retour à la ligne final
-				break
-			}
-		}
-	}
+	<-d.done // On attend la fin
 
 	d.Stop()
 	fmt.Println("\n✅ Exploration terminée.")
@@ -171,7 +142,6 @@ func (d *Downloader) senderLoop() {
 
 		// 3. Check si on l'a déjà
 		if _, exists := d.server.Downloads.Get(hash); exists {
-			// On l'a déjà, mais il faut peut-être explorer ses enfants !
 			// On relance l'analyse des enfants pour être sûr d'avoir tout l'arbre.
 			datum, _ := d.server.Downloads.Get(hash)
 			d.processChildren(datum)
@@ -227,50 +197,75 @@ func (d *Downloader) responseLoop() {
 	}
 }
 
-// Worker 3 : Gère les timeouts et retransmissions
-func (d *Downloader) timeoutLoop() {
+// Worker 3 : Monitor (Timeouts + Détection de fin)
+func (d *Downloader) monitorLoop() {
 	defer d.wg.Done()
 
-	tick := time.NewTicker(500 * time.Millisecond)
+	tick := time.NewTicker(200 * time.Millisecond)
 	defer tick.Stop()
 
 	for d.running {
 		<-tick.C
 
+		d.mu.Lock()
+		inflightCount := len(d.pending)
+		windowSize := d.windowSize
+
+		queuedCount := len(d.workCh)
+
+		d.statsMu.Lock()
+		received := d.totalReceived
+		d.statsMu.Unlock()
+
+		fmt.Printf("\r%-100s\r", "") // Nettoyer avec 100 espaces
+		fmt.Printf("📊 Progression: %d reçus | En cours: %d | File d'attente: %d | Fenêtre: %d",
+			received, inflightCount, queuedCount, windowSize)
+
+		// Si plus rien en vol et plus rien à faire...
+		if inflightCount == 0 && queuedCount == 0 {
+			// Petite sécurité : on lâche le lock, on attend un poil et on revérifie
+			// (Au cas où un packet est en cours de traitement dans responseLoop)
+			d.mu.Unlock()
+			time.Sleep(100 * time.Millisecond)
+			d.mu.Lock()
+
+			if len(d.pending) == 0 && len(d.workCh) == 0 {
+				d.mu.Unlock()
+				close(d.done)
+				return
+			}
+		}
+
+		// --- LOGIQUE DE TIMEOUT ---
 		now := time.Now()
 		var retryList [][32]byte
+		timeoutDetected := false
 
-		d.mu.Lock()
 		for h, t := range d.pending {
 			if now.Sub(t) > d.timeout {
 				d.retries[h]++
 				if d.retries[h] > 3 {
-					// Trop d'essais, on lâche l'affaire pour ce noeud
 					fmt.Printf("⚠️ Timeout définitif sur %x\n", h)
 					delete(d.pending, h)
 				} else {
 					retryList = append(retryList, h)
-					d.pending[h] = now // Reset timer
+					d.pending[h] = now
 				}
+				timeoutDetected = true
 			}
 		}
 
-		// Ajuster la fenêtre seulement si taux d'échec significatif
-		if len(retryList) > 0 {
-			d.failureCount += len(retryList)
-			d.successCount = 0 // Reset succès après échec
-
-			// Diminuer la fenêtre seulement si échecs répétés
+		if timeoutDetected {
+			d.failureCount++
+			d.successCount = 0
 			if d.failureCount > 2 && d.windowSize > d.minWindowSize {
-				// Réduction standard : -40% (TCP-like)
-				newWindow := (d.windowSize * 3) / 5
-				d.windowSize = utils.MaxInt(newWindow, d.minWindowSize)
-				d.failureCount = 0 // Reset après ajustement
+				newWin := (d.windowSize * 3) / 5
+				d.windowSize = utils.MaxInt(newWin, d.minWindowSize)
+				d.failureCount = 0
 			}
 		}
 		d.mu.Unlock()
 
-		// Retransmission
 		for _, h := range retryList {
 			SendDatumRequest(d.server.Conn, d.peerAddr, h)
 		}
@@ -287,15 +282,11 @@ func (d *Downloader) processChildren(datum []byte) {
 		for _, e := range entries {
 			d.queueHash(e.Hash)
 		}
-
 	case merkle.TypeBigDirectory, merkle.TypeBig:
-		// Pour les BigNodes, le contenu c'est juste des hashs
 		hashes := merkle.ParseBigHashes(content)
 		for _, h := range hashes {
 			d.queueHash(h)
 		}
-
-		// TypeChunk : rien à faire, c'est une feuille (bout de fichier)
 	}
 }
 
@@ -305,7 +296,6 @@ func (d *Downloader) queueHash(h [32]byte) {
 	if _, ok := d.server.Downloads.Get(h); ok {
 		return
 	}
-
 	select {
 	case d.workCh <- h:
 	default:

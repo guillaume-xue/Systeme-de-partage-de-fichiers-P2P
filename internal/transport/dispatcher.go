@@ -26,11 +26,8 @@ func (d *DatumDispatcher) Subscribe(name string, handler DatumHandler) func() {
 	defer d.mu.Unlock()
 
 	id := atomic.AddInt64(&d.counter, 1)
-
 	d.subscribers[id] = handler
 
-	// On retourne une closure pour permettre à l'appelant de se désinscrire
-	// sans devoir retenir son ID.
 	return func() {
 		d.remove(id)
 	}
@@ -48,6 +45,14 @@ func (d *DatumDispatcher) Dispatch(hash [32]byte, datum []byte) {
 	defer d.mu.RUnlock()
 
 	for _, handler := range d.subscribers {
-		go handler(hash, datum)
+		go func(h DatumHandler) {
+			// Protège contre les panics
+			defer func() {
+				if r := recover(); r != nil {
+					// On ignore les panics dans les handlers
+				}
+			}()
+			h(hash, datum)
+		}(handler)
 	}
 }

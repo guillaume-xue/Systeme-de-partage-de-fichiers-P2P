@@ -11,10 +11,10 @@
   "network": {
     "timeout_seconds": 3,
     "keepalive_seconds": 120,
-    "max_window_size": 1024,
-    "initial_window": 8,
-    "min_window_size": 4,
-    "timeout_seconds_download": 2
+    "max_window_size": 256,
+    "initial_window": 10,
+    "min_window_size": 2,
+    "timeout_seconds_download": 1
   },
   "merkle": {
     "max_chunk_size": 1024,

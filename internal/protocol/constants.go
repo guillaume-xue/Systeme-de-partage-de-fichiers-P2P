@@ -21,6 +21,13 @@ const (
 
 	NatTraversalRequest  = 4
 	NatTraversalRequest2 = 5
+
+	// Bit 0 : je suis un relais NAT
+	ExtNatTraversalRelay = 1
+)
+
+const (
+	MaxQueueSize = 1024
 )
 
 var (

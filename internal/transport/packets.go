@@ -6,16 +6,21 @@ import (
 	"main/internal/crypto"
 	"main/internal/protocol"
 	"net"
-	"time"
+	"sync/atomic"
 )
+
+var globalPacketID uint32
+
+func getNextID() uint32 {
+	return atomic.AddUint32(&globalPacketID, 1)
+}
 
 // sendRaw centralise la logique de construction et d'envoi.
 func sendRaw(conn *net.UDPConn, dest *net.UDPAddr, typ uint8, body []byte, key *ecdsa.PrivateKey, replyTo uint32) (uint32, error) {
 	// 1. Gestion ID
 	id := replyTo
 	if id == 0 {
-		// ID aléatoire basé sur le temps (suffisant pour ce projet)
-		id = uint32(time.Now().UnixNano())
+		id = getNextID()
 	}
 
 	// 2. Construction Packet
@@ -72,13 +77,18 @@ func SendError(conn *net.UDPConn, dest *net.UDPAddr, msg string, replyTo uint32)
 // --- Handshake ---
 
 func SendHello(conn *net.UDPConn, dest *net.UDPAddr, name string, key *ecdsa.PrivateKey) (uint32, error) {
-	msg := &protocol.HelloMessage{Name: name}
-	// Hello DOIT être signé
+	msg := &protocol.HelloMessage{
+		Name:       name,
+		Extensions: protocol.ExtNatTraversalRelay,
+	}
 	return sendRaw(conn, dest, protocol.Hello, msg.EncodeBody(), key, 0)
 }
 
 func SendHelloReply(conn *net.UDPConn, dest *net.UDPAddr, name string, key *ecdsa.PrivateKey, replyTo uint32) error {
-	msg := &protocol.HelloMessage{Name: name}
+	msg := &protocol.HelloMessage{
+		Name:       name,
+		Extensions: protocol.ExtNatTraversalRelay,
+	}
 	_, err := sendRaw(conn, dest, protocol.HelloReply, msg.EncodeBody(), key, replyTo)
 	return err
 }

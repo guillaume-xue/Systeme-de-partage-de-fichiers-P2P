@@ -2,8 +2,10 @@ package transport
 
 import (
 	"fmt"
+	"io"
 	"main/internal/config"
 	"main/internal/merkle"
+	"main/internal/protocol"
 	"main/internal/utils"
 	"net"
 	"os"
@@ -19,11 +21,11 @@ type task struct {
 }
 
 // DiskDownloader : Télécharge direct sur le disque
-// Gère la window size pour ne pas tuer le réseau UDP
 type DiskDownloader struct {
 	server    *Server
 	peer      *net.UDPAddr
 	outputDir string
+	tempDir   string // dossier pour les chunks temporaires
 
 	// Flow Control
 	window    int
@@ -45,14 +47,13 @@ type DiskDownloader struct {
 	pathMapMu sync.Mutex
 
 	// Reconstruction
-	// On stocke les chemins des fichiers "Big" pour les reconstruire à la fin
 	bigFiles   map[[32]byte]string
 	bigFilesMu sync.Mutex
 
-	// Cache temporaire pour les noeuds intermédiaires (BigNodes, Directories)
-	// Les chunks de fichiers, eux, vont direct sur le disque.
-	cache   map[[32]byte][]byte
-	cacheMu sync.RWMutex
+	// Cache uniquement pour la STRUCTURE (BigNodes, Dirs).
+	// Les données brutes (Chunks) vont dans tempDir.
+	structureCache   map[[32]byte][]byte
+	structureCacheMu sync.RWMutex
 
 	// Stats
 	savedFiles   int
@@ -65,13 +66,20 @@ type DiskDownloader struct {
 	wg          sync.WaitGroup
 	unsubscribe func()
 	running     bool
+	// Channel pour signaler la fin
+	done chan struct{}
 }
 
 func NewDiskDownloader(server *Server, peer *net.UDPAddr, output string) *DiskDownloader {
+	// Création d'un dossier temporaire caché dans le dossier de destination
+	tempDir := filepath.Join(output, ".tmp_chunks")
+	os.MkdirAll(tempDir, 0755)
+
 	return &DiskDownloader{
 		server:    server,
 		peer:      peer,
 		outputDir: output,
+		tempDir:   tempDir,
 
 		// Params fenêtre
 		window:    config.GlobalConfig.Network.InitialWindow,
@@ -82,14 +90,15 @@ func NewDiskDownloader(server *Server, peer *net.UDPAddr, output string) *DiskDo
 		inflight: make(map[[32]byte]time.Time),
 		retries:  make(map[[32]byte]int),
 
-		workQueue:  make(chan task, 10000), // Buffer large pour ne pas bloquer (valeur arbitraire)
-		responseCh: make(chan [32]byte, 100),
+		workQueue:  make(chan task, protocol.MaxQueueSize),
+		responseCh: make(chan [32]byte, protocol.MaxQueueSize),
 
-		pathMap:  make(map[[32]byte]string),
-		bigFiles: make(map[[32]byte]string),
-		cache:    make(map[[32]byte][]byte),
+		pathMap:        make(map[[32]byte]string),
+		bigFiles:       make(map[[32]byte]string),
+		structureCache: make(map[[32]byte][]byte),
 
 		running: true,
+		done:    make(chan struct{}),
 	}
 }
 
@@ -111,21 +120,22 @@ func (d *DiskDownloader) DownloadToDisk(rootHash [32]byte) error {
 	go d.processorLoop()
 	go d.monitorLoop()
 
-	// 4. On lance la machine avec la racine
 	fmt.Printf("📥 Start DL -> %s (Root: %x...)\n", d.outputDir, rootHash[:6])
 
-	// On doit d'abord télécharger le datum pour connaître son type
-	// On commence par demander le hash
+	// 4. On lance la machine
 	d.workQueue <- task{hash: rootHash, path: "__ROOT__"} // Marker spécial, utile pour différencier root ou autre
 
-	// 5. Attente
-	d.waitFinish()
+	// 5. Attente passive
+	<-d.done
 
 	// 6. Reconstruction finale (Assemblage des gros fichiers)
 	d.finalizeBigFiles()
 
 	// 7. Cleanup
 	d.stop()
+
+	// 8. Suppression du dossier temporaire
+	os.RemoveAll(d.tempDir)
 
 	fmt.Printf("\n✅ Fini ! %d fichiers, %s sur le disque.\n", d.savedFiles, utils.FormatBytesInt64(d.savedBytes))
 	return nil
@@ -142,65 +152,48 @@ func (d *DiskDownloader) stop() {
 	d.wg.Wait()
 }
 
-// waitFinish boucle tant qu'il y a du boulot
-func (d *DiskDownloader) waitFinish() {
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		<-ticker.C
-
-		d.pendingMu.Lock()
-		inflightCount := len(d.inflight)
-		windowSize := d.window
-		d.pendingMu.Unlock()
-
-		queuedCount := len(d.workQueue)
-
-		d.statsMu.Lock()
-		savedFiles := d.savedFiles
-		savedBytes := d.savedBytes
-		d.statsMu.Unlock()
-
-		// Affichage de progression - nettoyer la ligne d'abord
-		fmt.Printf("\r%-100s\r", "") // Nettoyer avec 100 espaces
-		fmt.Printf("💾 Téléchargement: (%d fichiers, %s) | En cours: %d | File: %d | Fenêtre: %d",
-			savedFiles, utils.FormatBytesInt64(savedBytes), inflightCount, queuedCount, windowSize)
-
-		// Si plus rien en cours, plus rien dans la queue, on suppose que c'est fini
-		if inflightCount == 0 && queuedCount == 0 {
-			// Petite pause de sécurité pour être sûr qu'un process en cours n'ajoute pas un truc
-			time.Sleep(500 * time.Millisecond)
-			if len(d.inflight) == 0 && len(d.workQueue) == 0 {
-				fmt.Println() // Retour à la ligne final
-				break
-			}
-		}
-	}
-}
-
-// Callback appelé par le Dispatcher UDP
+// Callback UDP
 func (d *DiskDownloader) onDatumReceived(hash [32]byte, data []byte) {
-	// On stocke d'abord en cache
-	d.cacheMu.Lock()
-	d.cache[hash] = data
-	d.cacheMu.Unlock()
+	// On détermine si c'est un Chunk (Data) ou une Structure (Node)
+	typ, _ := merkle.ParseDatum(data)
 
-	// On signale au processeur
-	// Select non-bloquant pour ne pas freezer le thread réseau UDP si le channel est plein
+	if typ == merkle.TypeChunk {
+		// ÉCRITURE DISQUE IMMÉDIATE (Pour économiser la RAM)
+		// J'ai du implémenter ca à cause de gros fichiers qui saturent la RAM.
+		// Gros téléchargement de 1 2Go a planté sinon.
+		err := d.writeTempChunk(hash, data)
+		if err != nil {
+			fmt.Printf("❌ Erreur écriture temp chunk %x: %v\n", hash, err)
+			return
+		}
+	} else {
+		// stockage ram (Pour la structure de l'arbre)
+		d.structureCacheMu.Lock()
+		d.structureCache[hash] = data
+		d.structureCacheMu.Unlock()
+	}
+
+	// Signal réception
 	select {
 	case d.responseCh <- hash:
 	default:
-		// Drop signal, le timeout s'en chargera ou le prochain packet
 	}
+}
+
+// writeTempChunk écrit un chunk sur le disque dans le dossier temp
+func (d *DiskDownloader) writeTempChunk(hash [32]byte, data []byte) error {
+	// On encode le hash en hex pour le nom de fichier
+	filename := fmt.Sprintf("%x", hash)
+	path := filepath.Join(d.tempDir, filename)
+
+	// Ici on écrit tout le data (header inclu).
+	return os.WriteFile(path, data, 0644)
 }
 
 // WORKER 1 : Envoie les requêtes
 func (d *DiskDownloader) senderLoop() {
 	defer d.wg.Done()
-
 	for d.running {
-		// Vérif fenêtre
 		d.pendingMu.Lock()
 		canSend := len(d.inflight) < d.window
 		d.pendingMu.Unlock()
@@ -214,15 +207,18 @@ func (d *DiskDownloader) senderLoop() {
 		tache, ok := <-d.workQueue
 		if !ok {
 			return
-		} // Channel fermé
+		}
 
-		// Check si déjà reçu (cache)
-		d.cacheMu.RLock()
-		_, gotIt := d.cache[tache.hash]
-		d.cacheMu.RUnlock()
+		// Check RAM Cache (Structure)
+		d.structureCacheMu.RLock()
+		_, inRam := d.structureCache[tache.hash]
+		d.structureCacheMu.RUnlock()
 
-		if gotIt {
-			// On le traite direct comme si on venait de le recevoir
+		// Check Disk Cache (Chunk)
+		inDisk := d.hasTempChunk(tache.hash)
+
+		if inRam || inDisk {
+			// Déjà là, on traite
 			d.processDatum(tache.hash, tache.path)
 			continue
 		}
@@ -235,12 +231,18 @@ func (d *DiskDownloader) senderLoop() {
 		}
 
 		d.trackPath(tache.hash, tache.path)
-
 		d.inflight[tache.hash] = time.Now()
 		d.pendingMu.Unlock()
 
 		SendDatumRequest(d.server.Conn, d.peer, tache.hash)
 	}
+}
+
+func (d *DiskDownloader) hasTempChunk(hash [32]byte) bool {
+	filename := fmt.Sprintf("%x", hash)
+	path := filepath.Join(d.tempDir, filename)
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func (d *DiskDownloader) trackPath(hash [32]byte, p string) {
@@ -261,26 +263,22 @@ func (d *DiskDownloader) getPath(hash [32]byte) string {
 // WORKER 2 : Traite les réponses
 func (d *DiskDownloader) processorLoop() {
 	defer d.wg.Done()
-
 	for hash := range d.responseCh {
 		d.pendingMu.Lock()
 		start, ok := d.inflight[hash]
 		if ok {
-			// Incrémenter le compteur de succès
 			d.successCount++
-			d.failureCount = 0 // Reset les échecs
+			d.failureCount = 0
 
 			// Augmenter la fenêtre seulement si réponse rapide
 			// Si réponse lente, on est proche de la limite -> ne pas augmenter
 			if time.Since(start) < d.timeout/2 && d.window < d.maxWindow {
 				d.window++
 			}
-
 			delete(d.inflight, hash)
 			delete(d.retries, hash) // Reset retry count
 		}
 		d.pendingMu.Unlock()
-
 		path := d.getPath(hash) // Récup le path sauvegardé
 		d.processDatum(hash, path)
 	}
@@ -294,19 +292,36 @@ func (d *DiskDownloader) monitorLoop() {
 
 	for d.running {
 		<-tick.C
-		now := time.Now()
 
 		d.pendingMu.Lock()
+		inflightCount := len(d.inflight)
+		queuedCount := len(d.workQueue)
+
+		// Logique de fin
+		if inflightCount == 0 && queuedCount == 0 {
+			// Petite vérif double
+			d.pendingMu.Unlock()
+			time.Sleep(200 * time.Millisecond)
+			d.pendingMu.Lock()
+			if len(d.inflight) == 0 && len(d.workQueue) == 0 {
+				d.pendingMu.Unlock()
+				close(d.done)
+				return
+			}
+		}
+
+		// Gestion des timeouts
+		now := time.Now()
 		timeoutCount := 0
 		var retryList [][32]byte
+
 		for hash, sentAt := range d.inflight {
 			if now.Sub(sentAt) > d.timeout {
 				timeoutCount++
-				// Timeout !
 				d.retries[hash]++
-				if d.retries[hash] > 5 {
+				if d.retries[hash] > 3 {
 					// Trop d'échecs, on abandonne ce chunk
-					fmt.Printf("⚠️ Give up on %x\n", hash)
+					fmt.Printf("⚠️ Abandon définitif chunk %x\n", hash)
 					delete(d.inflight, hash)
 					delete(d.retries, hash)
 				} else {
@@ -321,14 +336,13 @@ func (d *DiskDownloader) monitorLoop() {
 		// Ne pas pénaliser pour quelques timeouts isolés
 		if timeoutCount > 0 {
 			d.failureCount += timeoutCount
-			d.successCount = 0 // Reset succès après échec
+			d.successCount = 0
 
 			// Diminuer la fenêtre seulement si échecs répétés
 			// Seuil à 2 pour réagir plus vite
 			if d.failureCount > 2 && d.window > d.minWindow {
-				newWindow := (d.window * 3) / 5 // Réduction à 60%
-				d.window = utils.MaxInt(newWindow, d.minWindow)
-				d.failureCount = 0 // Reset après ajustement
+				d.window = utils.MaxInt((d.window*3)/5, d.minWindow) // -40%
+				d.failureCount = 0
 			}
 		}
 
@@ -343,25 +357,27 @@ func (d *DiskDownloader) monitorLoop() {
 
 // Traitement d'un datum reçu
 func (d *DiskDownloader) processDatum(hash [32]byte, destPath string) {
-	d.cacheMu.RLock()
-	data, exists := d.cache[hash]
-	d.cacheMu.RUnlock()
+	// 1. Essayer de lire en RAM (Structure)
+	d.structureCacheMu.RLock()
+	data, inRam := d.structureCache[hash]
+	d.structureCacheMu.RUnlock()
 
-	if !exists {
-		return
+	// 2. Si pas en RAM, essayer sur disque (Chunk)
+	if !inRam {
+		var err error
+		data, err = os.ReadFile(filepath.Join(d.tempDir, fmt.Sprintf("%x", hash)))
+		if err != nil {
+			return // Pas trouvé, on attendra que le receiver le reçoive
+		}
 	}
 
 	typ, content := merkle.ParseDatum(data)
 
-	// Cas spécial si c'est le hash de départ (marqué __ROOT__), on détermine le chemin approprié
+	// Gestion du nom ROOT
 	if destPath == "__ROOT__" {
-		// Déterminer le nom de fichier/dossier selon le type
 		if typ == merkle.TypeDirectory || typ == merkle.TypeBigDirectory {
-			// C'est un dossier, on crée un sous-dossier avec le hash comme nom
-			// L'arborescence interne gardera les noms corrects car ils sont dans les Directory entries
 			destPath = filepath.Join(d.outputDir, fmt.Sprintf("dir_%x", hash))
 		} else {
-			// C'est un fichier, on crée un nom de fichier avec le hash
 			destPath = filepath.Join(d.outputDir, fmt.Sprintf("file_%x", hash))
 		}
 		fmt.Printf("📝 Type détecté: %d, destination: %s\n", typ, destPath)
@@ -374,52 +390,41 @@ func (d *DiskDownloader) processDatum(hash [32]byte, destPath string) {
 		}
 		entries := merkle.ParseDirectoryEntries(content)
 		for _, e := range entries {
-			// Calcul du chemin enfant
 			childPath := ""
 			if destPath != "" {
 				childPath = filepath.Join(destPath, merkle.GetEntryName(e))
 			}
-			// On ajoute à la file
 			d.workQueue <- task{hash: e.Hash, path: childPath}
 		}
 
 	case merkle.TypeBigDirectory:
-		// Un gros dossier, c'est juste une liste de hashs qui pointent vers des Directory partiels
 		hashes := merkle.ParseBigHashes(content)
 		for _, hash := range hashes {
-			// On propage le même path (c'est le même dossier, juste fragmenté)
 			d.workQueue <- task{hash: hash, path: destPath}
 		}
 
 	case merkle.TypeChunk:
 		if destPath != "" {
-			fmt.Printf("💾 Sauvegarde chunk -> %s (%d bytes)\n", destPath, len(content))
+			// On écrit le contenu
 			err := os.WriteFile(destPath, content, 0644)
 			if err == nil {
+				d.statsMu.Lock()
 				d.savedFiles++
 				d.savedBytes += int64(len(content))
-			} else {
-				fmt.Printf("❌ Erreur écriture: %v\n", err)
+				d.statsMu.Unlock()
 			}
 		}
 
 	case merkle.TypeBig:
-		// Fichier fragmenté. On ne peut pas écrire les bouts en vrac car on ne connait pas l'ordre
-		// sans parser tout l'arbre.
-		// On télécharge tout en cache, et on note qu'il faudra le reconstruire à la fin.
-
-		// 1. On note le hash et le path pour plus tard
+		// Fichier fragmenté. On note pour reconstruction plus tard.
 		if destPath != "" {
-			fmt.Printf("📦 Fichier fragmenté détecté: %s\n", destPath)
 			d.bigFilesMu.Lock()
 			d.bigFiles[hash] = destPath
 			d.bigFilesMu.Unlock()
 		}
-
-		// 2. On demande les enfants (sans path, car ce sont des bouts bruts)
 		hashes := merkle.ParseBigHashes(content)
-		for _, hash := range hashes {
-			d.workQueue <- task{hash: hash, path: ""}
+		for _, h := range hashes {
+			d.workQueue <- task{hash: h, path: ""}
 		}
 	}
 }
@@ -436,51 +441,66 @@ func (d *DiskDownloader) finalizeBigFiles() {
 	fmt.Printf("\n🔨 Reconstruction de %d gros fichiers...\n", len(d.bigFiles))
 
 	for hash, path := range d.bigFiles {
-		fmt.Printf("📦 Reconstruction %s...\n", filepath.Base(path))
-		content, ok := d.reconstruct(hash)
-		if ok {
-			err := os.WriteFile(path, content, 0644)
-			if err == nil {
-				d.savedFiles++
-				d.savedBytes += int64(len(content))
-				fmt.Printf("✅ %s (%s)\n", filepath.Base(path), utils.FormatBytesInt64(int64(len(content))))
-			} else {
-				fmt.Printf("❌ Erreur écriture %s: %v\n", filepath.Base(path), err)
-			}
+		fmt.Printf("📦 Assemblage %s... ", filepath.Base(path))
+
+		// Création du fichier final
+		outFile, err := os.Create(path)
+		if err != nil {
+			fmt.Printf("❌ Erreur création: %v\n", err)
+			continue
+		}
+
+		// Assemblage streamé
+		size, err := d.assembleStream(hash, outFile)
+		outFile.Close()
+
+		if err == nil {
+			d.statsMu.Lock()
+			d.savedFiles++
+			d.savedBytes += size
+			d.statsMu.Unlock()
+			fmt.Printf("✅ (%s)\n", utils.FormatBytesInt64(size))
 		} else {
-			fmt.Printf("❌ Echec reconstruction %s (données manquantes)\n", filepath.Base(path))
+			fmt.Printf("❌ Echec: %v\n", err)
 		}
 	}
 }
 
-// Reconstruction récursive depuis le cache RAM
-func (d *DiskDownloader) reconstruct(hash [32]byte) ([]byte, bool) {
-	d.cacheMu.RLock()
-	data, ok := d.cache[hash]
-	d.cacheMu.RUnlock()
+// assembleStream parcourt l'arbre et copie les chunks disque -> destination
+// Retourne la taille totale écrite
+func (d *DiskDownloader) assembleStream(hash [32]byte, writer io.Writer) (int64, error) {
+	d.structureCacheMu.RLock()
+	data, isStruct := d.structureCache[hash]
+	d.structureCacheMu.RUnlock()
 
-	if !ok {
-		return nil, false
-	}
-
-	typ, content := merkle.ParseDatum(data)
-
-	if typ == merkle.TypeChunk {
-		return content, true
-	}
-
-	if typ == merkle.TypeBig {
-		var full []byte
-		hashes := merkle.ParseBigHashes(content)
-		for _, hash := range hashes {
-			part, ok := d.reconstruct(hash)
-			if !ok {
-				return nil, false
-			}
-			full = append(full, part...)
+	if isStruct {
+		// C'est un BigNode (intermédiaire)
+		typ, content := merkle.ParseDatum(data)
+		if typ != merkle.TypeBig {
+			return 0, fmt.Errorf("structure invalide dans assembleStream (type %d)", typ)
 		}
-		return full, true
+
+		var totalSize int64
+		children := merkle.ParseBigHashes(content)
+		for _, childHash := range children {
+			written, err := d.assembleStream(childHash, writer)
+			if err != nil {
+				return totalSize, err
+			}
+			totalSize += written
+		}
+		return totalSize, nil
 	}
 
-	return nil, false
+	// Si pas en RAM, c'est un Chunk sur disque (Temp)
+	chunkPath := filepath.Join(d.tempDir, fmt.Sprintf("%x", hash))
+	chunkData, err := os.ReadFile(chunkPath)
+	if err != nil {
+		return 0, fmt.Errorf("chunk manquant: %x", hash[:8])
+	}
+
+	_, content := merkle.ParseDatum(chunkData)
+
+	n, err := writer.Write(content)
+	return int64(n), err
 }

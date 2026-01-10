@@ -430,7 +430,6 @@ func (m *InteractiveMenu) pingSpam(addresses []*net.UDPAddr, _ string, count int
 	stopSending := make(chan bool)
 
 	// Calculer le timeout total basé sur le backoff exponentiel
-	// count=5 → 0 + 1 + 2 + 4 + 8 = 15 secondes + marge
 	totalTimeout := time.Duration(0)
 	for i := range count {
 		if i == 0 {
