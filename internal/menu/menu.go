@@ -363,6 +363,11 @@ func (m *InteractiveMenu) sendNatTraversalViaPeer(targetAddresses []*net.UDPAddr
 		return false, nil
 	}
 
+	if !relayPeer.IsRelay {
+		fmt.Printf("❌ Peer relais %s n'est pas configuré comme relais NAT.\n", relayPeerName)
+		return false, nil
+	}
+
 	fmt.Printf("🚀 Utilisation de %s comme relais (%d adresse(s))\n", relayPeerName, len(relayPeer.Addrs))
 
 	// Filtrer les adresses en fonction de nos protocols
