@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"main/internal/config"
@@ -103,15 +104,18 @@ func NewDiskDownloader(server *Server, peer *net.UDPAddr, output string) *DiskDo
 }
 
 // DownloadToDisk télécharge l'arborescence complète et la sauvegarde sur disque
-func (d *DiskDownloader) DownloadToDisk(rootHash [32]byte) error {
+func (d *DiskDownloader) DownloadToDisk(ctx context.Context, rootHash [32]byte) error {
 	// 1. Setup dossier
 	if err := os.MkdirAll(d.outputDir, 0755); err != nil {
 		return fmt.Errorf("mkdir fail: %v", err)
 	}
 
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	// 2. Abonnement aux events UDP
-	// On utilise un ID random pour éviter les collisions si on lance plusieurs DL
-	subID := fmt.Sprintf("dl_%d", time.Now().UnixNano())
+	// On utilise le hash comme ID
+	subID := fmt.Sprintf("dl_%d", rootHash)
 	d.unsubscribe = d.server.DatumDispatcher.Subscribe(subID, d.onDatumReceived)
 
 	// 3. Démarrage workers
@@ -120,7 +124,15 @@ func (d *DiskDownloader) DownloadToDisk(rootHash [32]byte) error {
 	go d.processorLoop()
 	go d.monitorLoop()
 
-	fmt.Printf("📥 Start DL -> %s (Root: %x...)\n", d.outputDir, rootHash[:6])
+	fmt.Printf("📥 Start DL -> %s (Root: %x...)\n", d.outputDir, rootHash)
+
+	select {
+	case <-d.done:
+	case <-ctx.Done():
+		d.stop()
+		os.RemoveAll(d.tempDir)
+		return ctx.Err()
+	}
 
 	// 4. On lance la machine
 	d.workQueue <- task{hash: rootHash, path: "__ROOT__"} // Marker spécial, utile pour différencier root ou autre

@@ -2,6 +2,7 @@ package menu
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"main/internal/config"
 	"main/internal/merkle"
@@ -40,7 +41,7 @@ func NewMenu(server *transport.Server, serverAddr *net.UDPAddr) *InteractiveMenu
 }
 
 // Run démarre la boucle principale du menu interactif
-func (m *InteractiveMenu) Run() {
+func (m *InteractiveMenu) Run(ctx context.Context) {
 	fmt.Println("\n==========================================")
 	fmt.Printf("   	   CLIENT P2P : %s\n", config.GlobalConfig.Peer.Name)
 	fmt.Println("==========================================")
@@ -66,7 +67,7 @@ func (m *InteractiveMenu) Run() {
 		case "3":
 			m.explorePeer()
 		case "4":
-			m.downloadManual()
+			m.downloadManual(ctx)
 		case "5":
 			m.showConnections()
 		case "6":
@@ -197,7 +198,7 @@ func (m *InteractiveMenu) explorePeer() {
 }
 
 // 4. Téléchargement via hash
-func (m *InteractiveMenu) downloadManual() {
+func (m *InteractiveMenu) downloadManual(ctx context.Context) {
 	pInfo, pName := m.pickConnectedPeer()
 	if pInfo == nil {
 		return
@@ -219,11 +220,14 @@ func (m *InteractiveMenu) downloadManual() {
 		}
 		targetHash = parsedHash
 	}
+	// Gestion Ctrl+C
+	dlCtx, cancel := context.WithTimeout(ctx, 3 * time.Minute)
+	defer cancel()
 
 	destDir := filepath.Join("downloads", utils.CleanName(pName))
 	fmt.Printf("📂 Destination: %s\n", destDir)
 	diskDownloader := transport.NewDiskDownloader(m.server, pInfo.GetAddr(), destDir)
-	if err := diskDownloader.DownloadToDisk(targetHash); err != nil {
+	if err := diskDownloader.DownloadToDisk(dlCtx, targetHash); err != nil {
 		fmt.Printf("❌ Erreur lors du téléchargement: %v\n", err)
 	}
 	m.waitKey()

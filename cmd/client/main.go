@@ -115,7 +115,7 @@ func run(ctx context.Context) error {
 
 	// Interface Utilisateur
 	interactiveMenu := menu.NewMenu(server, serverAddr)
-	interactiveMenu.Run()
+	interactiveMenu.Run(ctx)
 
 	return nil
 }
