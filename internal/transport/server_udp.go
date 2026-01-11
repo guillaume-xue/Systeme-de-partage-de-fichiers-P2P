@@ -24,6 +24,7 @@ type serverUDP struct {
 
 	LocalMerkle    *merkle.Merkle
 	DownloadMerkle *merkle.Merkle
+	rootHash       []byte
 }
 
 func (s *serverUDP) init() {
@@ -214,6 +215,10 @@ func processRootReply(s *serverUDP, conn *net.UDPConn, addr *net.UDPAddr, data [
 	}
 	fmt.Printf("ROOT REPLY reçu (ID:%d) pour le hash : %x\n", id, hash)
 	s.DownloadMerkle.Clean()
+	s.mutex.Lock()
+	s.rootHash = hash
+	s.mutex.Unlock()
+	go s.MonitorDownload(hash, conn, addr)
 }
 
 func processDatum(s *serverUDP, conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
@@ -403,6 +408,100 @@ func (s *serverUDP) ReconstructTree(nodeHash []byte, targetPath string) error {
 	}
 
 	return fmt.Errorf("type de nœud inconnu : %d", nodeType)
+}
+
+// FindMissingNodes parcourt l'arbre à partir de rootHash et retourne les hashs manquants
+func (s *serverUDP) FindMissingNodes(rootHash []byte) ([][]byte, error) {
+	var missing [][]byte
+
+	// 1. Vérifier si le nœud racine lui-même est présent
+	data, exists := s.DownloadMerkle.GetNode(rootHash)
+	if !exists {
+		// Le nœud est manquant, on doit le (re)demander
+		return [][]byte{rootHash}, nil
+	}
+
+	// 2. Si on a le nœud, on regarde s'il a des enfants à vérifier
+	nodeType := data[0]
+
+	switch nodeType {
+	case merkle.TypeChunk: // 0
+		// C'est une feuille et on l'a. Tout va bien.
+		return nil, nil
+
+	case merkle.TypeBig, merkle.TypeBigDirectory, merkle.TypeDirectory:
+		// C'est un nœud conteneur (liste de hashs)
+		// Note : Il faut utiliser la bonne fonction de parsing selon le type
+		// Ici je simplifie en supposant une fonction générique ou un switch
+		var children [][]byte
+		var err error
+
+		switch nodeType {
+		case merkle.TypeBig:
+			children, err = merkle.ParseBig(data[1:])
+		case merkle.TypeBigDirectory:
+			children, err = merkle.ParseBigDirectory(data[1:])
+		default:
+			// Directory classique (attention au parsing Nom+Hash)
+			entries, _ := merkle.ParseDirectory(data[1:])
+			for _, e := range entries {
+				children = append(children, e.Hash)
+			}
+		}
+
+		if err != nil {
+			return nil, err
+		}
+
+		// RÉCURSION : On vérifie chaque enfant
+		for _, childHash := range children {
+			childMissing, _ := s.FindMissingNodes(childHash)
+			// On ajoute les manquants trouvés dans la sous-branche
+			missing = append(missing, childMissing...)
+		}
+	}
+
+	return missing, nil
+}
+
+func (s *serverUDP) MonitorDownload(rootHash []byte, conn *net.UDPConn, peerAddr *net.UDPAddr) {
+	if rootHash == nil {
+		return
+	}
+	// On crée un ticker qui "tique" toutes les 2 secondes
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	// On boucle tant que le téléchargement n'est pas fini
+	for range ticker.C {
+		// 1. Lister les pièces manquantes
+		missing, _ := s.FindMissingNodes(rootHash)
+
+		// 2. Si la liste est vide, c'est FINI !
+		if len(missing) == 0 {
+			fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+			fmt.Println("✓ Téléchargement complet (100%) !")
+			fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+			fmt.Printf("💡 Vous pouvez maintenant reconstruire avec:\n")
+			fmt.Printf("   construct %x\n", rootHash)
+			fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+			return
+		}
+
+		// 3. Sinon, on relance les demandes (RETRY) par lots
+		maxRetry := 100 // Limiter à 100 paquets par cycle
+		retryCount := len(missing)
+		if retryCount > maxRetry {
+			retryCount = maxRetry
+		}
+
+		fmt.Printf("🔄 Détection de %d paquets manquants. Redemande de %d...\n", len(missing), retryCount)
+
+		for i := 0; i < retryCount; i++ {
+			// On renvoie un DatumRequest pour chaque trou
+			SendPacket(conn, peerAddr, uint32(time.Now().Unix()), protocol.DatumRequest, missing[i])
+		}
+	}
 }
 
 func RunServerUDP() {
