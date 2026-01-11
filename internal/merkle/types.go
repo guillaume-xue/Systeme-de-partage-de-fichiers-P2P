@@ -54,7 +54,8 @@ func (m *Merkle) PrintAllNodes() {
 
 func (m *Merkle) GetNode(hash []byte) ([]byte, bool) {
 	m.mutex.RLock()
-	data, exists := m.node[string(hash)]
+	hashStr := fmt.Sprintf("%x", hash)
+	data, exists := m.node[hashStr]
 	defer m.mutex.RUnlock()
 	return data, exists
 }
@@ -70,4 +71,11 @@ func (m *Merkle) Empty() bool {
 	empty := len(m.node) == 0
 	defer m.mutex.RUnlock()
 	return empty
+}
+
+func (m *Merkle) Count() int {
+	m.mutex.RLock()
+	count := len(m.node)
+	defer m.mutex.RUnlock()
+	return count
 }

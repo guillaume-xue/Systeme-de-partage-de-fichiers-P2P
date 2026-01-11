@@ -3,10 +3,12 @@ package transport
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"main/internal/merkle"
 	"main/internal/protocol"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -68,7 +70,7 @@ func (s *serverUDP) pingLoop() {
 		return
 	}
 
-	ticker := time.NewTicker(4 * time.Minute)
+	ticker := time.NewTicker(2 * time.Minute)
 	s.mutex.Lock()
 	s.timer = ticker
 	s.mutex.Unlock()
@@ -133,7 +135,6 @@ func handlePacket(s *serverUDP, remoteAddr *net.UDPAddr, data []byte, option str
 		processRootReply(s, conn, remoteAddr, data)
 	case protocol.Ping:
 		fmt.Println("Ping reçu")
-		// TODO: Répondre avec Ok
 	case protocol.Ok:
 		fmt.Println("Ok reçu")
 	case protocol.DatumRequest:
@@ -145,7 +146,7 @@ func handlePacket(s *serverUDP, remoteAddr *net.UDPAddr, data []byte, option str
 	case protocol.Timeout:
 		fmt.Println("Timeout reçu")
 	case protocol.Error:
-		fmt.Println("Error reçu")
+		processErreur(conn, remoteAddr, data)
 	default:
 		fmt.Printf("Message type %d reçu\n", msgType)
 	}
@@ -228,13 +229,180 @@ func processDatum(s *serverUDP, conn *net.UDPConn, addr *net.UDPAddr, data []byt
 		return
 	}
 	if len(child) > 0 {
-		fmt.Println("Contenu du Directory/BigDirectory:")
+		nodeType := value[0]
+		switch nodeType {
+		case merkle.TypeDirectory, merkle.TypeBigDirectory:
+			fmt.Println("Contenu du Directory/BigDirectory:")
+		case merkle.TypeBig:
+			fmt.Println("Contenu du fichier fragmenté (TypeBig):")
+		}
 		for _, entry := range child {
 			fmt.Printf(" - Entrée: %x\n", entry)
 			SendPacket(conn, addr, uint32(0), protocol.DatumRequest, entry)
 		}
 	}
-	time.Sleep(1 * time.Second)
+}
+
+func processErreur(conn *net.UDPConn, addr *net.UDPAddr, data []byte) {
+	_, _, _, errMsg, _, err := protocol.DecodeMessages(data)
+	if err != nil {
+		fmt.Println("Erreur décodage Error:", err)
+		return
+	}
+	fmt.Printf("ERROR reçu de %s : %s\n", addr, string(errMsg))
+}
+
+func (s *serverUDP) WriteFileContent(nodeHash []byte, writer io.Writer) error {
+	data, exists := s.DownloadMerkle.GetNode(nodeHash)
+	if !exists {
+		return fmt.Errorf("morceau manquant : %x", nodeHash)
+	}
+
+	nodeType := data[0]
+	switch nodeType {
+	case merkle.TypeChunk: // 0
+		_, err := writer.Write(data[1:]) // On écrit sans le header
+		return err
+	case merkle.TypeBig: // 2
+		hashes, _ := merkle.ParseBig(data[1:])
+		for _, h := range hashes {
+			if err := s.WriteFileContent(h, writer); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("type fichier invalide: %d", nodeType)
+	}
+}
+
+func (s *serverUDP) CollectDirEntries(nodeHash []byte) ([]merkle.DirEntry, error) {
+	data, exists := s.DownloadMerkle.GetNode(nodeHash)
+	if !exists {
+		return nil, fmt.Errorf("dossier manquant : %x (téléchargement peut-être incomplet, attendez plus longtemps)", nodeHash)
+	}
+
+	nodeType := data[0]
+	var allEntries []merkle.DirEntry
+
+	switch nodeType {
+	case merkle.TypeDirectory: // 1
+		return merkle.ParseDirectory(data[1:])
+	case merkle.TypeBigDirectory: // 4
+		hashes, _ := merkle.ParseBigDirectory(data[1:])
+		for _, h := range hashes {
+			subEntries, err := s.CollectDirEntries(h)
+			if err != nil {
+				return nil, err
+			}
+			allEntries = append(allEntries, subEntries...)
+		}
+		return allEntries, nil
+	default:
+		return nil, fmt.Errorf("ce n'est pas un dossier : %d", nodeType)
+	}
+}
+
+func (s *serverUDP) CheckTreeComplete(nodeHash []byte, visited map[string]bool) (bool, []string) {
+	hashStr := fmt.Sprintf("%x", nodeHash)
+
+	if visited[hashStr] {
+		return true, nil
+	}
+	visited[hashStr] = true
+
+	data, exists := s.DownloadMerkle.GetNode(nodeHash)
+	if !exists {
+		return false, []string{hashStr}
+	}
+
+	if len(data) == 0 {
+		return false, []string{hashStr}
+	}
+
+	nodeType := data[0]
+	var missing []string
+
+	switch nodeType {
+	case merkle.TypeChunk:
+		return true, nil
+
+	case merkle.TypeBig:
+		hashes, _ := merkle.ParseBig(data[1:])
+		for _, h := range hashes {
+			complete, missingNodes := s.CheckTreeComplete(h, visited)
+			if !complete {
+				missing = append(missing, missingNodes...)
+			}
+		}
+
+	case merkle.TypeDirectory:
+		entries, _ := merkle.ParseDirectory(data[1:])
+		for _, entry := range entries {
+			complete, missingNodes := s.CheckTreeComplete(entry.Hash, visited)
+			if !complete {
+				missing = append(missing, missingNodes...)
+			}
+		}
+
+	case merkle.TypeBigDirectory:
+		hashes, _ := merkle.ParseBigDirectory(data[1:])
+		for _, h := range hashes {
+			complete, missingNodes := s.CheckTreeComplete(h, visited)
+			if !complete {
+				missing = append(missing, missingNodes...)
+			}
+		}
+	}
+
+	if len(missing) > 0 {
+		return false, missing
+	}
+	return true, nil
+}
+
+func (s *serverUDP) ReconstructTree(nodeHash []byte, targetPath string) error {
+
+	data, exists := s.DownloadMerkle.GetNode(nodeHash)
+	if !exists {
+		return fmt.Errorf("nœud racine manquant : %x", nodeHash)
+	}
+	nodeType := data[0]
+
+	if nodeType == merkle.TypeDirectory || nodeType == merkle.TypeBigDirectory {
+		fmt.Printf("Création du dossier : %s\n", targetPath)
+
+		err := os.MkdirAll(targetPath, 0755)
+		if err != nil {
+			return err
+		}
+
+		entries, err := s.CollectDirEntries(nodeHash)
+		if err != nil {
+			return err
+		}
+
+		for _, entry := range entries {
+			childPath := filepath.Join(targetPath, entry.Name)
+			err := s.ReconstructTree(entry.Hash, childPath)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if nodeType == merkle.TypeChunk || nodeType == merkle.TypeBig {
+		fmt.Printf("Écriture du fichier : %s\n", targetPath)
+		f, err := os.Create(targetPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		return s.WriteFileContent(nodeHash, f)
+	}
+
+	return fmt.Errorf("type de nœud inconnu : %d", nodeType)
 }
 
 func RunServerUDP() {
@@ -287,7 +455,16 @@ func RunServerUDP() {
 			RegisterClient(s.Conn4, s.Conn6)
 			s.StartPing()
 		case "help":
-			fmt.Println("Commandes disponibles : addr, list, key, register, help")
+			fmt.Println("Commandes disponibles :")
+			fmt.Println("  register - S'enregistrer sur le serveur")
+			fmt.Println("  rootrequest <ipv4|ipv6> <nom> - Demander le root hash")
+			fmt.Println("  datumrequest <ipv4|ipv6> <hash> - Demander un datum")
+			fmt.Println("  count - Afficher le nombre de nœuds téléchargés")
+			fmt.Println("  print - Afficher tous les nœuds")
+			fmt.Println("  construct <hash> - Reconstruire l'arbre")
+			fmt.Println("  addr <nom> - Obtenir l'adresse d'un peer")
+			fmt.Println("  list - Lister les peers")
+			fmt.Println("  key <nom> - Obtenir la clé publique d'un peer")
 		case "rootrequest":
 			if len(parts) < 2 {
 				fmt.Println("Usage: rootrequest <nom>")
@@ -328,6 +505,47 @@ func RunServerUDP() {
 			}
 		case "print":
 			s.DownloadMerkle.PrintAllNodes()
+		case "count":
+			count := s.DownloadMerkle.Count()
+			fmt.Printf("Nombre de nœuds téléchargés : %d\n", count)
+		case "construct":
+			if len(parts) < 2 {
+				fmt.Println("Usage: construct <hash>")
+				break
+			}
+			hashStr := parts[1]
+			hash := make([]byte, 32)
+			n, err := fmt.Sscanf(hashStr, "%x", &hash)
+			if err != nil || n != 1 {
+				fmt.Println("Hash invalide.")
+				break
+			}
+
+			// Vérifier que tous les nœuds sont présents
+			fmt.Println("Vérification de la complétude de l'arbre...")
+			visited := make(map[string]bool)
+			complete, missing := s.CheckTreeComplete(hash, visited)
+			if !complete {
+				fmt.Printf("⚠️  Téléchargement incomplet ! %d nœuds manquants:\n", len(missing))
+				for i, m := range missing {
+					if i < 5 {
+						fmt.Printf("  - %s\n", m)
+					}
+				}
+				if len(missing) > 5 {
+					fmt.Printf("  ... et %d autres\n", len(missing)-5)
+				}
+				fmt.Println("💡 Attendez que tous les DATUM soient reçus, puis réessayez.")
+				break
+			}
+
+			fmt.Println("✓ Arbre complet, démarrage de la reconstruction...")
+			err = s.ReconstructTree(hash, "Downloads/Reconstructed")
+			if err != nil {
+				fmt.Println("Erreur reconstruction:", err)
+			} else {
+				fmt.Println("✓ Reconstruction terminée avec succès !")
+			}
 		default:
 			fmt.Println("Commande non reconnue.")
 		}

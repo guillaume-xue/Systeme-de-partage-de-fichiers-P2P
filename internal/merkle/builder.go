@@ -1,8 +1,15 @@
 package merkle
 
 import (
+	"bytes"
 	"fmt"
+	"strings"
 )
+
+type DirEntry struct {
+	Name string
+	Hash []byte
+}
 
 func (m *Merkle) ParseValue(value []byte) ([][]byte, error) {
 	m.AddNode(value)
@@ -12,17 +19,26 @@ func (m *Merkle) ParseValue(value []byte) ([][]byte, error) {
 	case TypeChunk:
 		return nil, nil
 	case TypeBig:
-		return m.ParseChunk(value[1:])
+		return ParseBig(value[1:])
 	case TypeDirectory:
-		return m.ParseDirectory(value[1:])
+		entries, err := ParseDirectory(value[1:])
+		if err != nil {
+			return nil, err
+		}
+		// Extraire juste les hash pour la compatibilité
+		var hashes [][]byte
+		for _, entry := range entries {
+			hashes = append(hashes, entry.Hash)
+		}
+		return hashes, nil
 	case TypeBigDirectory:
-		return m.ParseBigDirectory(value[1:])
+		return ParseBigDirectory(value[1:])
 	default:
 		return nil, fmt.Errorf("type de nœud inconnu: %d", value[0])
 	}
 }
 
-func (m *Merkle) ParseChunk(data []byte) ([][]byte, error) {
+func ParseBig(data []byte) ([][]byte, error) {
 	var child [][]byte
 
 	count := len(data) / 32
@@ -36,21 +52,28 @@ func (m *Merkle) ParseChunk(data []byte) ([][]byte, error) {
 	return child, nil
 }
 
-func (m *Merkle) ParseDirectory(data []byte) ([][]byte, error) {
+func ParseDirectory(data []byte) ([]DirEntry, error) {
 
 	entries := len(data) / DirEntrySize
 
-	var dirs [][]byte
+	var dirEntries []DirEntry
 	for i := 0; i < entries; i++ {
 		entry := data[i*DirEntrySize : (i+1)*DirEntrySize]
-		fmt.Printf(" - Nom: %s, Hash: %x\n", string(entry[:32]), entry[32:])
-		dirs = append(dirs, entry[32:])
+		nameBytes := entry[:32]
+		name := string(bytes.TrimRight(nameBytes, "\x00"))
+		name = strings.TrimSpace(name)
+		hash := entry[32:64]
+		fmt.Printf(" - Nom: %s, Hash: %x\n", name, hash)
+		dirEntries = append(dirEntries, DirEntry{
+			Name: name,
+			Hash: hash,
+		})
 	}
 	fmt.Printf("Directory avec %d entrées\n", entries)
-	return dirs, nil
+	return dirEntries, nil
 }
 
-func (m *Merkle) ParseBigDirectory(data []byte) ([][]byte, error) {
+func ParseBigDirectory(data []byte) ([][]byte, error) {
 	var dirs [][]byte
 
 	count := len(data) / 32
