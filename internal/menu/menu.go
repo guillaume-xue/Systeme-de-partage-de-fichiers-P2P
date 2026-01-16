@@ -133,7 +133,7 @@ func (m *InteractiveMenu) connectToPeer() {
 	fmt.Println("Tentative de connexion...")
 
 	// Phase 1: Tentatives de connexion directe
-	isConnected := m.sendDirectConnection(targets, pName, 5)
+	isConnected := m.sendDirectConnection(targets, pName, 3)
 
 	// Phase 2: NAT traversal si la connexion directe échoue
 	if !isConnected {
@@ -145,7 +145,8 @@ func (m *InteractiveMenu) connectToPeer() {
 		relayChoice = strings.TrimSpace(relayChoice)
 
 		// Configurer le canal de réception AVANT d'envoyer les requêtes NAT
-		responseChan := make(chan *net.UDPAddr, 5)
+		// Buffer = nb d'adresses pour éviter de perdre des réponses
+		responseChan := make(chan *net.UDPAddr, max(len(targets), 10))
 		m.server.PingResponseMu.Lock()
 		m.server.PingResponseChan = responseChan
 		m.server.PingResponseMu.Unlock()
