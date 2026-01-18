@@ -47,10 +47,7 @@ func (pm *PeerManager) AddOrUpdate(name string, addr *net.UDPAddr, pubKey *ecdsa
 		// Ajouter l'adresse si elle n'existe pas déjà
 		found := false
 		for _, existingAddr := range peer.Addrs {
-			if existingAddr.Port != addr.Port {
-				continue
-			}
-			if existingAddr.IP.Equal(addr.IP) {
+			if existingAddr.IP.Equal(addr.IP) && existingAddr.Port == addr.Port {
 				found = true
 				break
 			}
