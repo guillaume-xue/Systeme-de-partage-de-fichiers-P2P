@@ -250,6 +250,11 @@ func (m *InteractiveMenu) showConnections() {
 				fmt.Printf("	Adresse %d: %s\n", i+1, addr)
 			}
 			fmt.Printf("    Dernière activité: %s\n", info.LastSeen.Format("15:04:05"))
+			if info.IsRelay {
+				fmt.Println("    🔄 Peut être utilisé comme relais NAT traversal")
+			} else {
+				fmt.Println("    ❌ Ne peut pas être utilisé comme relais NAT traversal")
+			}
 		}
 	}
 	m.waitKey()
