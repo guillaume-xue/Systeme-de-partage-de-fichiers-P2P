@@ -341,13 +341,12 @@ func (s *Server) onNatRequest(pkt *protocol.Packet, srcAddr *net.UDPAddr) {
 	// On dit OK à Src
 	SendOk(s.Conn, srcAddr, pkt.Header.ID)
 
-	// On envoie une notif à Target (à toutes ses adresses connues)
-	fmt.Printf("🔀 NAT: %s veut contacter %s via nous\n", srcAddr, targetPeer.Name)
+	// On envoie une notif à Target à l'adresse demandée
+	fmt.Printf("🔀 NAT: %s veut contacter %s (%s) via nous\n", srcAddr, targetPeer.Name, targetAddr)
 
-	// Envoyer NatTraversalRequest2 à toutes les adresses de la cible
-	for _, addr := range targetPeer.Addrs {
-		SendNatTraversalRequest2(s.Conn, addr, srcAddr, s.PrivKey)
-	}
+	// Envoyer NatTraversalRequest2 à l'adresse spécifique demandée par le source
+	SendNatTraversalRequest2(s.Conn, targetAddr, srcAddr, s.PrivKey)
+
 }
 
 func (s *Server) onNatRequest2(pkt *protocol.Packet, relayAddr *net.UDPAddr) {

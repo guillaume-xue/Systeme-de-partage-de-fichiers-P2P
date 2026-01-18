@@ -75,7 +75,7 @@ func DetectLocalIPProtocol() (hasIPv4 bool, hasIPv6 bool) {
 	return hasIPv4, hasIPv6
 }
 
-func FiltrerAddressesByProtocol(filteredTargets, filteredRelayAddrs []*net.UDPAddr) (bool, []*net.UDPAddr, []*net.UDPAddr, []*net.UDPAddr, []*net.UDPAddr) {
+func FiltrerAddressesByProtocol(filteredTargets []*net.UDPAddr) ([]*net.UDPAddr, []*net.UDPAddr) {
 
 	// Séparer les adresses par protocole
 	var targetIPv4, targetIPv6 []*net.UDPAddr
@@ -87,24 +87,7 @@ func FiltrerAddressesByProtocol(filteredTargets, filteredRelayAddrs []*net.UDPAd
 		}
 	}
 
-	var relayIPv4, relayIPv6 []*net.UDPAddr
-	for _, addr := range filteredRelayAddrs {
-		if addr.IP.To4() != nil {
-			relayIPv4 = append(relayIPv4, addr)
-		} else {
-			relayIPv6 = append(relayIPv6, addr)
-		}
-	}
-
-	// Vérifier qu'il y a au moins un protocole compatible
-	hasCompatibleProtocol := (len(targetIPv4) > 0 && len(relayIPv4) > 0) ||
-		(len(targetIPv6) > 0 && len(relayIPv6) > 0)
-
-	if !hasCompatibleProtocol {
-		return false, nil, nil, nil, nil
-	}
-
-	return true, targetIPv4, targetIPv6, relayIPv4, relayIPv6
+	return targetIPv4, targetIPv6
 }
 
 func AddrParserSolver(rawAddr string) (targets []*net.UDPAddr) {
