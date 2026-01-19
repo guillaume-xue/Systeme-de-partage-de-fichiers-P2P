@@ -72,7 +72,7 @@ func DetectLocalIPProtocol() (hasIPv4 bool, hasIPv6 bool) {
 	return hasIPv4, hasIPv6
 }
 
-func FiltrerAddressesByProtocol(filteredTargets []*net.UDPAddr) ([]*net.UDPAddr, []*net.UDPAddr) {
+func SeperateAddressesByProtocol(filteredTargets []*net.UDPAddr) ([]*net.UDPAddr, []*net.UDPAddr) {
 	// Séparer les adresses par protocole
 	var targetIPv4, targetIPv6 []*net.UDPAddr
 	for _, addr := range filteredTargets {

@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"main/internal/config"
@@ -16,6 +17,11 @@ import (
 // Client global avec un timeout pour ne pas freezer l'app si l'annuaire est down
 var httpClient = &http.Client{
 	Timeout: 5 * time.Second,
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // Ignore la vérification des certificats SSL
+		},
+	},
 }
 
 // GetListPeers récupère la liste des noms enregistrés

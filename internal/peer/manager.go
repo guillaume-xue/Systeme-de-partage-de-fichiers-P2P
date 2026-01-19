@@ -48,20 +48,26 @@ func (pm *PeerManager) AddOrUpdate(name string, addr *net.UDPAddr, pubKey *ecdsa
 	defer pm.mu.Unlock()
 
 	now := time.Now()
+	isIPv4 := addr.IP.To4() != nil
 
 	if peer, exists := pm.peers[name]; exists {
 		peer.LastSeen = now
 		peer.IsRelay = isRelay
-		// Chercher si l'adresse existe déjà et mettre à jour son LastSeen
+
+		// Chercher et remplacer l'adresse du même protocole
 		found := false
 		for i := range peer.Addrs {
-			if peer.Addrs[i].Addr.IP.Equal(addr.IP) && peer.Addrs[i].Addr.Port == addr.Port {
+			existingIsIPv4 := peer.Addrs[i].Addr.IP.To4() != nil
+			if existingIsIPv4 == isIPv4 {
+				// Remplacer l'adresse du même protocole
+				peer.Addrs[i].Addr = addr
 				peer.Addrs[i].LastSeen = now
 				found = true
 				break
 			}
 		}
 		if !found {
+			// Ajouter la nouvelle adresse (protocole différent)
 			peer.Addrs = append(peer.Addrs, AddrInfo{
 				Addr:     addr,
 				LastSeen: now,
