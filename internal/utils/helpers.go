@@ -3,6 +3,7 @@ package utils
 import (
 	"encoding/hex"
 	"fmt"
+	"main/internal/merkle"
 	"main/internal/protocol"
 	"net"
 	"strings"
@@ -62,21 +63,16 @@ func CleanName(pName string) string {
 
 // detectLocalIPProtocol détecte si on supporte IPv4 et/ou IPv6
 func DetectLocalIPProtocol() (hasIPv4 bool, hasIPv6 bool) {
-	// Tester IPv4
 	if _, err := net.ResolveUDPAddr("udp4", protocol.GetServerUDPv4()); err == nil {
 		hasIPv4 = true
 	}
-
-	// Tester IPv6
 	if _, err := net.ResolveUDPAddr("udp6", protocol.GetServerUDPv6()); err == nil {
 		hasIPv6 = true
 	}
-
 	return hasIPv4, hasIPv6
 }
 
 func FiltrerAddressesByProtocol(filteredTargets []*net.UDPAddr) ([]*net.UDPAddr, []*net.UDPAddr) {
-
 	// Séparer les adresses par protocole
 	var targetIPv4, targetIPv6 []*net.UDPAddr
 	for _, addr := range filteredTargets {
@@ -115,4 +111,51 @@ func CalExpo2Time(count int) time.Duration {
 		totalTimeout += time.Duration(1<<uint(i-1)) * time.Second
 	}
 	return totalTimeout
+}
+
+// Une interface pour gérer d'où viennent les données (DL arbo ou DL disque)
+type DatumProvider interface {
+	Get(hash [32]byte) ([]byte, bool)
+}
+
+func PrintTree(provider DatumProvider, hash [32]byte, prefix, fileName string, isLast bool) {
+	datum, found := provider.Get(hash)
+
+	marker := "├── "
+	if isLast {
+		marker = "└── "
+	}
+
+	if !found {
+		fmt.Printf("%s%s [???] nom: %s (manquant) %x\n", prefix, marker, fileName, hash)
+		return
+	}
+	nodeType, nodeData := merkle.ParseDatum(datum)
+
+	newPrefix := prefix + "│   "
+	if isLast {
+		newPrefix = prefix + "    "
+	}
+
+	switch nodeType {
+	case merkle.TypeDirectory:
+		entries := merkle.ParseDirectoryEntries(nodeData)
+		fmt.Printf("%s%s%s 📁 [DIR] (%d items) %x\n", prefix, marker, fileName, len(entries), hash)
+
+		for i, e := range entries {
+			PrintTree(provider, e.Hash, newPrefix, merkle.GetEntryName(e), i == len(entries)-1)
+		}
+	case merkle.TypeBigDirectory:
+		entries := merkle.ParseBigHashes(nodeData)
+		fmt.Printf("%s%s%s 📁 [BIG-DIR] (%d items) %x\n", prefix, marker, fileName, len(entries), hash)
+
+		for i, e := range entries {
+			PrintTree(provider, e, newPrefix, "", i == len(entries)-1)
+		}
+	case merkle.TypeChunk:
+		fmt.Printf("%s%s%s 📄 [FILE] (%s) %x\n", prefix, marker, fileName, FormatBytesInt64(int64(len(nodeData))), hash)
+
+	case merkle.TypeBig:
+		fmt.Printf("%s%s%s 📄 [BIG-FILE] (%s) %x\n", prefix, marker, fileName, FormatBytesInt64(int64(len(nodeData))), hash)
+	}
 }

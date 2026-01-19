@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -21,28 +22,24 @@ func main() {
 	defer cancel()
 
 	// Gestion des signaux système (SIGINT, SIGTERM)
-	// Qui aurait cru que j'allait devoir réimplémenter ça après les cours de L2
-	sigChan := make(chan os.Signal, 1)
+	// Qui aurait cru que j'allait devoir réimplémenter ça après les cours de L2...
+	sigChan := make(chan os.Signal, 1) // 1 Suffit en général, on reçoit un signal à la fois
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Canal pour récupérer le résultat de run()
-	// On le met à 1 pour ne pas bloquer si le main quitte avant
+	// Reception résultat du programme
 	done := make(chan error, 1)
 
-	// Lancement du programme principal
 	go func() {
-		// Le résultat de run (erreur ou nil) est envoyé dans le canal 'done'
 		done <- run(ctx)
 	}()
 
-	// On attend soit un signal système, soit la fin du programme
 	select {
 	case sig := <-sigChan:
-		// Cas A : L'utilisateur fait CTRL+C
+		// Cas: CTRL+C
 		fmt.Printf("\n🛑 Signal reçu (%v), fermeture en cours...\n", sig)
 		cancel() // On prévient run() qu'il faut arrêter via le contexte
 	case err := <-done:
-		// Cas B : Le menu est quitté ou une erreur critique survient
+		// Cas: Le menu est quitté ou une erreur critique survient
 		if err != nil {
 			log.Fatal("❌ Erreur critique : %w\n", err)
 		}
@@ -50,7 +47,7 @@ func main() {
 	}
 }
 
-// run encapsule la logique pour permettre de 'defer' correctement
+// Programme principal
 func run(ctx context.Context) error {
 	fmt.Println("\n======= Client P2P - Système de fichiers =======")
 	fmt.Println()
@@ -108,6 +105,8 @@ func run(ctx context.Context) error {
 	// Routine keep-alive
 	go server.KeepAlive(serverAddr, cfg.Network.KeepAlive, ctx)
 	fmt.Printf("✅ Keep-alive activé (%v)\n", cfg.Network.KeepAlive)
+
+	time.Sleep(1 * time.Second) // Laisser le temps de tout initialiser avec les precedents requetes
 
 	fmt.Println("\n✅ Client démarré!")
 	fmt.Printf("   Nom: %s\n", cfg.Peer.Name)

@@ -280,8 +280,6 @@ func (s *Server) onDatum(pkt *protocol.Packet) {
 		return
 	}
 
-	// fmt.Printf("📥 Réception datum %x... (%d bytes)\n", hash, len(val))
-
 	// Vérif intégrité
 	if sha256.Sum256(val) != hash {
 		fmt.Println("❌ Datum corrompu reçu (Hash mismatch)")
@@ -290,8 +288,7 @@ func (s *Server) onDatum(pkt *protocol.Packet) {
 
 	// Stockage
 	s.Downloads.Set(hash, val)
-	// fmt.Printf("💾 Datum %x... stocké dans Downloads\n", hash[:8])
-
+	
 	// Notification aux downloaders en attente
 	s.DatumDispatcher.Dispatch(hash, val)
 }
@@ -527,8 +524,8 @@ func (s *Server) KeepAlive(serverAddr *net.UDPAddr, interval time.Duration, ctx 
 			if len(connectedPeers) > 0 {
 				for _, peerName := range connectedPeers {
 					if peerInfo, ok := s.PeerManager.Get(peerName); ok {
-						for _, addr := range peerInfo.Addrs {
-							SendPing(s.Conn, addr)
+						for _, addrInfo := range peerInfo.Addrs {
+							SendPing(s.Conn, addrInfo.Addr)
 							time.Sleep(1 * time.Millisecond)
 						}
 					}

@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"main/internal/config"
-	"main/internal/merkle"
 	"main/internal/peer"
 	"main/internal/protocol"
 	"main/internal/transport"
@@ -18,6 +17,10 @@ import (
 	"time"
 )
 
+/*
+	Structure et fonctions du menu interactif
+*/
+
 type InteractiveMenu struct {
 	server       *transport.Server
 	serverAddr   *net.UDPAddr
@@ -28,13 +31,9 @@ type InteractiveMenu struct {
 }
 
 func NewMenu(server *transport.Server, serverAddr *net.UDPAddr) *InteractiveMenu {
-	// Détecter les protocols IP locales une seule fois
+	// Détecter les protocols ip supportés
 	hasIPv4, hasIPv6 := utils.DetectLocalIPProtocol()
-
 	scanner := bufio.NewScanner(os.Stdin)
-	// Limite le buffer à 1MB pour éviter memory spike sur input malveillant
-	scanner.Buffer(make([]byte, 4096), 1024*1024)
-
 	return &InteractiveMenu{
 		server:     server,
 		serverAddr: serverAddr,
@@ -107,27 +106,24 @@ func (m *InteractiveMenu) listDirectoryPeers() {
 	m.waitKey()
 }
 
-// 2. Se connecter (Direct + NAT Traversal)
+// 2. Se connecter à un pair (Direct + NAT Traversal)
 func (m *InteractiveMenu) connectToPeer() {
 	pName := m.ask("Nom du peer cible : ")
 	if pName == "" {
 		fmt.Println("Nom de peer vide")
 		return
 	}
-	// Récup IP
-	rawAddr, err := transport.GetAddr(pName)
+	// Récup ip, parser et filtrer
+	listAddr, err := transport.GetAddr(pName)
 	if err != nil {
 		fmt.Printf("Impossible de récupérer les adresses de %s: %v\n", pName, err)
 		return
 	}
-
-	// Parser et résoudre les adresses
-	targets := utils.AddrParserSolver(rawAddr)
+	targets := utils.AddrParserSolver(listAddr)
 	if len(targets) == 0 {
 		fmt.Println("Pas d'adresses valides trouvées.")
 		return
 	}
-
 	targets = m.filterAddressesByProtocol(targets)
 	if len(targets) == 0 {
 		fmt.Println("Aucune adresse compatible avec nos protocols IP.")
@@ -135,34 +131,30 @@ func (m *InteractiveMenu) connectToPeer() {
 	}
 
 	fmt.Println("Tentative de connexion...")
-
-	// Phase 1: Tentatives de connexion directe
+	// Phase 1: Tentatives de connexion directe, 3 tentatives
 	isConnected := m.sendDirectConnection(targets, pName, 3)
 
 	// Phase 2: NAT traversal si la connexion directe échoue
 	if !isConnected {
-		// Demander quel relais utiliser
 		fmt.Println("\n--- Choix du relais pour NAT traversal ---")
 		fmt.Println("Appuyez sur Entrée (ou tapez 'default') pour utiliser le serveur central")
 		fmt.Println("Ou entrez le nom d'un peer connecté pour l'utiliser comme relais")
-		relayChoice := m.ask("Relais : ")
-		relayChoice = strings.TrimSpace(relayChoice)
+		choixRelais := m.ask("Relais : ")
+		choixRelais = strings.TrimSpace(choixRelais)
 
-		// Configurer les canaux de réception pour chaque adresse cible AVANT d'envoyer les requêtes NAT
+		// Configurer les canaux de réception pour chaque adresse trouvées avant d'envoyer les requêtes NAT
 		responseChan := make(chan *net.UDPAddr, max(len(targets)*2, 10))
 		m.server.PingResponseMu.Lock()
-		// Enregistrer un canal pour chaque adresse cible
 		for _, target := range targets {
 			m.server.PingResponseChans[target.String()] = responseChan
 		}
 		m.server.PingResponseMu.Unlock()
 
-		if relayChoice == "" || relayChoice == "default" {
-			// Utiliser le serveur central
-			relayChoice = "jch.irif.fr"
+		if choixRelais == "" || choixRelais == "default" {
+			choixRelais = "jch.irif.fr"
 		}
-		fmt.Printf("--- Tentative NAT traversal via %s... ---\n", relayChoice)
-		natPierced, usedAddrs := m.sendNatTraversalViaPeer(targets, relayChoice, responseChan, pName)
+		fmt.Printf("--- Tentative NAT traversal via %s... ---\n", choixRelais)
+		natPerce, addrReussi := m.sendNatTraversalViaPeer(targets, choixRelais, responseChan, pName)
 
 		// Cleanup des canaux
 		m.server.PingResponseMu.Lock()
@@ -172,8 +164,8 @@ func (m *InteractiveMenu) connectToPeer() {
 		m.server.PingResponseMu.Unlock()
 
 		// Si le NAT est percé, tenter la connexion avec Hello sur les adresses qui ont fonctionné
-		if natPierced {
-			isConnected = m.sendDirectConnection(usedAddrs, pName, 3)
+		if natPerce {
+			isConnected = m.sendDirectConnection(addrReussi, pName, 3)
 		}
 	}
 
@@ -202,7 +194,7 @@ func (m *InteractiveMenu) explorePeer() {
 	dl.DownloadTree(targetHash)
 
 	fmt.Println("\n--- ARBORESCENCE DISTANTE ---")
-	m.printTree(m.server.Downloads, targetHash, "", "", true)
+	utils.PrintTree(m.server.Downloads, targetHash, "", "", true)
 	m.waitKey()
 }
 
@@ -222,7 +214,6 @@ func (m *InteractiveMenu) downloadManual(ctx context.Context) {
 			return
 		}
 	} else {
-		// Parser le hash entré par l'utilisateur
 		parsedHash, err := utils.ParseHash(hashInput)
 		if err != nil {
 			return
@@ -230,7 +221,7 @@ func (m *InteractiveMenu) downloadManual(ctx context.Context) {
 		targetHash = parsedHash
 	}
 	// Gestion Ctrl+C
-	dlCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	dlCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
 	destDir := filepath.Join("downloads", utils.CleanName(pName))
@@ -254,8 +245,8 @@ func (m *InteractiveMenu) showConnections() {
 		for _, pName := range connectedPeers {
 			info, _ := m.server.PeerManager.Get(pName)
 			fmt.Printf("\n  - %s\n", pName)
-			for i, addr := range info.Addrs {
-				fmt.Printf("	Adresse %d: %s\n", i+1, addr)
+			for i, addrInfo := range info.Addrs {
+				fmt.Printf("	Adresse %d: %s\n", i+1, addrInfo.Addr)
 			}
 			fmt.Printf("    Dernière activité: %s\n", info.LastSeen.Format("15:04:05"))
 			if info.IsRelay {
@@ -280,56 +271,9 @@ func (m *InteractiveMenu) showLocalFiles() {
 	fmt.Printf("  Datums dans le store: %d\n", m.server.MerkleStore.Len())
 
 	fmt.Println("\n  Arborescence:")
-	m.printTree(m.server.MerkleStore, m.server.RootHash, "  ", "", true)
+	utils.PrintTree(m.server.MerkleStore, m.server.RootHash, "  ", "", true)
 
 	m.waitKey()
-}
-
-// Une interface pour gérer d'où viennent les données (DL arbo ou DL disque)
-type DatumProvider interface {
-	Get(hash [32]byte) ([]byte, bool)
-}
-
-func (m *InteractiveMenu) printTree(provider DatumProvider, hash [32]byte, prefix, fileName string, isLast bool) {
-	datum, found := provider.Get(hash)
-
-	marker := "├── "
-	if isLast {
-		marker = "└── "
-	}
-
-	if !found {
-		fmt.Printf("%s%s [???] nom: %s (manquant) %x\n", prefix, marker, fileName, hash)
-		return
-	}
-	nodeType, nodeData := merkle.ParseDatum(datum)
-
-	newPrefix := prefix + "│   "
-	if isLast {
-		newPrefix = prefix + "    "
-	}
-
-	switch nodeType {
-	case merkle.TypeDirectory:
-		entries := merkle.ParseDirectoryEntries(nodeData)
-		fmt.Printf("%s%s%s 📁 [DIR] (%d items) %x\n", prefix, marker, fileName, len(entries), hash)
-
-		for i, e := range entries {
-			m.printTree(provider, e.Hash, newPrefix, merkle.GetEntryName(e), i == len(entries)-1)
-		}
-	case merkle.TypeBigDirectory:
-		entries := merkle.ParseBigHashes(nodeData)
-		fmt.Printf("%s%s%s 📁 [BIG-DIR] (%d items) %x\n", prefix, marker, fileName, len(entries), hash)
-
-		for i, e := range entries {
-			m.printTree(provider, e, newPrefix, "", i == len(entries)-1)
-		}
-	case merkle.TypeChunk:
-		fmt.Printf("%s%s%s 📄 [FILE] (%s) %x\n", prefix, marker, fileName, utils.FormatBytesInt64(int64(len(nodeData))), hash)
-
-	case merkle.TypeBig:
-		fmt.Printf("%s%s%s 📄 [BIG-FILE] (%s) %x\n", prefix, marker, fileName, utils.FormatBytesInt64(int64(len(nodeData))), hash)
-	}
 }
 
 // ask pose une question et retourne la réponse
@@ -348,18 +292,16 @@ func (m *InteractiveMenu) waitKey() {
 
 // Envoie des Hello pour tenter une connexion directe
 func (m *InteractiveMenu) sendDirectConnection(addresses []*net.UDPAddr, pName string, maxAttempts int) bool {
-	// Capturer le timestamp actuel avant d'envoyer les Hello
 	startTime := time.Now()
 
 	for range maxAttempts {
 		for _, addr := range addresses {
 			transport.SendHello(m.server.Conn, addr, m.server.MyName, m.server.PrivKey)
 		}
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 
 		// Vérifier si le peer existe et a été vu récemment
 		if peerInfo, exists := m.server.PeerManager.Get(pName); exists {
-			// Le peer doit avoir été vu après qu'on ait commencé à envoyer les Hello
 			if peerInfo.LastSeen.After(startTime) {
 				return true
 			}
@@ -368,7 +310,7 @@ func (m *InteractiveMenu) sendDirectConnection(addresses []*net.UDPAddr, pName s
 	return false
 }
 
-// sendNatTraversalViaPeer utilise un peer comme relais pour le NAT traversal
+// sendNatTraversalViaPeer utilise un pair comme relais pour le NAT traversal
 func (m *InteractiveMenu) sendNatTraversalViaPeer(targetAddresses []*net.UDPAddr, relayPeerName string, responseChan chan *net.UDPAddr, pName string) (bool, []*net.UDPAddr) {
 	// Vérifier que le peer relais est connecté
 	relayPeer, exists := m.server.PeerManager.Get(relayPeerName)
@@ -399,8 +341,7 @@ func (m *InteractiveMenu) sendNatTraversalViaPeer(targetAddresses []*net.UDPAddr
 			transport.SendNatTraversalRequest(m.server.Conn, relayPeer.GetAddr(), targetAddr, m.server.PrivKey)
 		}
 
-		// Tester avec pingSpam
-		if m.pingSpam(targetIPv6, pName, 3, responseChan) {
+		if m.pingSpam(targetIPv6, 3, responseChan) {
 			fmt.Println("✅ NAT traversal réussi via IPv6")
 			return true, targetIPv6
 		}
@@ -414,8 +355,7 @@ func (m *InteractiveMenu) sendNatTraversalViaPeer(targetAddresses []*net.UDPAddr
 			transport.SendNatTraversalRequest(m.server.Conn, relayPeer.GetAddr(), targetAddr, m.server.PrivKey)
 		}
 
-		// Tester avec pingSpam
-		if m.pingSpam(targetIPv4, pName, 3, responseChan) {
+		if m.pingSpam(targetIPv4, 3, responseChan) {
 			fmt.Println("✅ NAT traversal réussi via IPv4")
 			return true, targetIPv4
 		}
@@ -427,90 +367,59 @@ func (m *InteractiveMenu) sendNatTraversalViaPeer(targetAddresses []*net.UDPAddr
 
 // pingSpam envoie plusieurs pings pour percer le NAT avec backoff exponentiel
 // Retourne true dès réception d'un ping du pair ou d'un OK en réponse
-// Utilise un backoff exponentiel : 0s, 1s, 2s, 4s, 8s, etc.
-func (m *InteractiveMenu) pingSpam(addresses []*net.UDPAddr, _ string, count int, responseChan chan *net.UDPAddr) bool {
+func (m *InteractiveMenu) pingSpam(addresses []*net.UDPAddr, count int, responseChan chan *net.UDPAddr) bool {
 	// Créer une map des adresses cibles pour vérification rapide
 	targetAddrs := make(map[string]bool)
 	for _, addr := range addresses {
 		targetAddrs[addr.String()] = true
 	}
 
-	// Canal pour signaler l'arrêt
-	stopSending := make(chan bool)
-
 	// Calculer le timeout total basé sur le backoff exponentiel
-	totalTimeout := time.Duration(0)
-	for i := range count {
-		if i == 0 {
-			// Premier envoi immédiat
-			continue
-		}
-		totalTimeout += time.Duration(1<<uint(i-1)) * time.Second
-	}
+	totalTimeout := utils.CalExpo2Time(count)
 
 	// Démarrer la surveillance
 	pierced := make(chan bool, 1)
 	go func() {
+		timeout := time.After(totalTimeout)
 		for {
 			select {
 			case receivedAddr := <-responseChan:
-				// Vérifier si c'est une des adresses cibles
 				if targetAddrs[receivedAddr.String()] {
-					close(stopSending) // Arrêter l'envoi immédiatement
-					select {
-					case pierced <- true:
-					default:
-					}
+					pierced <- true
 					return
 				}
-			case <-time.After(totalTimeout):
-				select {
-				case pierced <- false:
-				default:
-				}
+			case <-timeout:
+				pierced <- false
 				return
 			}
 		}
 	}()
 
-	// Vérifier si on a déjà reçu quelque chose
-	select {
-	case result := <-pierced:
-		return result
-	default:
-		// Continuer avec l'envoi de pings
-	}
-
 	// Envoyer les pings avec backoff exponentiel
 	for i := range count {
+		// Envoyer ping à toutes les adresses
+		for _, addr := range addresses {
+			transport.SendPing(m.server.Conn, addr)
+		}
+
+		// Vérifier si on a reçu une réponse
 		select {
-		case <-stopSending:
-			// Réception détectée, on arrête d'envoyer
-			result := <-pierced
+		case result := <-pierced:
 			return result
 		default:
-			// Envoyer ping à toutes les adresses
-			for _, addr := range addresses {
-				transport.SendPing(m.server.Conn, addr)
+		}
+
+		// Attendre avec backoff exponentiel (sauf après le dernier envoi)
+		if i < count-1 {
+			waitTime := time.Second
+			if i > 0 {
+				waitTime = time.Duration(1<<uint(i)) * time.Second
 			}
 
-			// Attendre avec backoff exponentiel
-			if i < count-1 { // Pas d'attente après le dernier envoi
-				var waitTime time.Duration
-				if i == 0 {
-					waitTime = 1 * time.Second
-				} else {
-					waitTime = time.Duration(1<<uint(i)) * time.Second
-				}
-
-				// Attendre avec possibilité d'interruption
-				select {
-				case <-stopSending:
-					result := <-pierced
-					return result
-				case <-time.After(waitTime):
-					// Continuer à la prochaine itération
-				}
+			select {
+			case result := <-pierced:
+				return result
+			case <-time.After(waitTime):
 			}
 		}
 	}
@@ -518,9 +427,6 @@ func (m *InteractiveMenu) pingSpam(addresses []*net.UDPAddr, _ string, count int
 	// Attendre le résultat final
 	select {
 	case result := <-pierced:
-		if result {
-			fmt.Println("✓ NAT percé!")
-		}
 		return result
 	case <-time.After(500 * time.Millisecond):
 		return false

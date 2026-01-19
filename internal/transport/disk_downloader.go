@@ -133,7 +133,7 @@ func (d *DiskDownloader) DownloadToDisk(ctx context.Context, rootHash [32]byte) 
 
 	// 4. On lance la machine avec la première tâche
 	d.workQueue <- task{hash: rootHash, path: "__ROOT__"} // Marker spécial, utile pour différencier root ou autre
-	// d.printStats()
+
 	// 5. Attente passive
 	select {
 	case <-d.done:

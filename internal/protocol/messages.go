@@ -167,7 +167,7 @@ type Packet struct {
 	Signature []byte // 64 bytes si présent, nil sinon
 }
 
-// Encode sconstruit le paquete final pour le réseau
+// Encode construit le paquet final pour le réseau
 func (p *Packet) Encode() []byte {
 	head := p.Header.Encode()
 	buf := make([]byte, len(head)+len(p.Body)+len(p.Signature))

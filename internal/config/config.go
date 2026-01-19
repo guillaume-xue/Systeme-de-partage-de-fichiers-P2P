@@ -7,7 +7,9 @@ import (
 	"time"
 )
 
-// Configuration json
+/*
+Structures et fonctions de gestion de la configuration du programme
+*/
 type Config struct {
 	Peer    PeerConfig    `json:"peer"`
 	Server  ServerConfig  `json:"server"`
@@ -51,12 +53,12 @@ var GlobalConfig *Config
 func Load(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("lecture config: %w", err)
+		return fmt.Errorf("Erreur de la lecture du fichier config: %w", err)
 	}
 
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return fmt.Errorf("parsing config JSON: %w", err)
+		return fmt.Errorf("Erreur dans le parsing de la config: %w", err)
 	}
 
 	// Conversion des durées
@@ -100,6 +102,7 @@ func DefaultConfig() *Config {
 			MinWindowSize:          2,
 			TimeoutSecondsDownload: 1,
 			TimeoutDownload:        1 * time.Second,
+			ProcessorWorkers:       20,
 		},
 		Merkle: MerkleConfig{
 			MaxChunkSize:   1024,

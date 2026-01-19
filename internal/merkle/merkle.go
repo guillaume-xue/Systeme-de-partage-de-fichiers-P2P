@@ -9,7 +9,6 @@ import (
 	"sync"
 )
 
-// Constances pour les types de noeuds Merkle
 const (
 	TypeChunk        = 0 // data pure
 	TypeDirectory    = 1 // Répertoire
@@ -207,7 +206,6 @@ func buildRecursive(store *Store, hashes [][32]byte, nodeType uint8) [32]byte {
 		parentHashes = append(parentHashes, hash)
 	}
 
-	// Appel récursif sur les parents
 	return buildRecursive(store, parentHashes, nodeType)
 }
 

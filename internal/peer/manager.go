@@ -7,19 +7,25 @@ import (
 	"time"
 )
 
+// AddrInfo contient une adresse et son timestamp
+type AddrInfo struct {
+	Addr     *net.UDPAddr
+	LastSeen time.Time
+}
+
 // PeerInfo contient les informations sur un peer
 type PeerInfo struct {
 	Name      string
-	Addrs     []*net.UDPAddr // Support IPv4 et IPv6
+	Addrs     []AddrInfo // Support IPv4 et IPv6 avec timestamps
 	PublicKey *ecdsa.PublicKey
 	LastSeen  time.Time
 	IsRelay   bool
 }
 
-// GetAddr retourne la première adresse (pour compatibilité)
+// GetAddr retourne la première adresse (en général la seule) du pair
 func (p *PeerInfo) GetAddr() *net.UDPAddr {
 	if len(p.Addrs) > 0 {
-		return p.Addrs[0]
+		return p.Addrs[0].Addr
 	}
 	return nil
 }
@@ -41,27 +47,36 @@ func (pm *PeerManager) AddOrUpdate(name string, addr *net.UDPAddr, pubKey *ecdsa
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
+	now := time.Now()
+
 	if peer, exists := pm.peers[name]; exists {
-		peer.LastSeen = time.Now()
+		peer.LastSeen = now
 		peer.IsRelay = isRelay
-		// Ajouter l'adresse si elle n'existe pas déjà
+		// Chercher si l'adresse existe déjà et mettre à jour son LastSeen
 		found := false
-		for _, existingAddr := range peer.Addrs {
-			if existingAddr.IP.Equal(addr.IP) && existingAddr.Port == addr.Port {
+		for i := range peer.Addrs {
+			if peer.Addrs[i].Addr.IP.Equal(addr.IP) && peer.Addrs[i].Addr.Port == addr.Port {
+				peer.Addrs[i].LastSeen = now
 				found = true
 				break
 			}
 		}
 		if !found {
-			peer.Addrs = append(peer.Addrs, addr)
+			peer.Addrs = append(peer.Addrs, AddrInfo{
+				Addr:     addr,
+				LastSeen: now,
+			})
 		}
 	} else {
 		// Nouveau peer
 		pm.peers[name] = &PeerInfo{
-			Name:      name,
-			Addrs:     []*net.UDPAddr{addr},
+			Name: name,
+			Addrs: []AddrInfo{{
+				Addr:     addr,
+				LastSeen: now,
+			}},
 			PublicKey: pubKey,
-			LastSeen:  time.Now(),
+			LastSeen:  now,
 			IsRelay:   isRelay,
 		}
 	}
@@ -81,8 +96,8 @@ func (pm *PeerManager) GetByAddr(addr *net.UDPAddr) (*PeerInfo, bool) {
 	defer pm.mu.RUnlock()
 
 	for _, peer := range pm.peers {
-		for _, peerAddr := range peer.Addrs {
-			if peerAddr.IP.Equal(addr.IP) && peerAddr.Port == addr.Port {
+		for _, addrInfo := range peer.Addrs {
+			if addrInfo.Addr.IP.Equal(addr.IP) && addrInfo.Addr.Port == addr.Port {
 				return peer, true
 			}
 		}
@@ -90,16 +105,34 @@ func (pm *PeerManager) GetByAddr(addr *net.UDPAddr) (*PeerInfo, bool) {
 	return nil, false
 }
 
-// CleanExpired supprime les peers inactifs (> 5 minutes sans message)
+// CleanExpired supprime les peers inactifs et les vieilles adresses
 func (pm *PeerManager) CleanExpired() {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
 	timeout := 5 * time.Minute
 	now := time.Now()
+
 	for name, peer := range pm.peers {
+		// Supprimer le peer entièrement s'il est inactif
 		if now.Sub(peer.LastSeen) > timeout {
 			delete(pm.peers, name)
+			continue
+		}
+
+		// Nettoyer les vieilles adresses du peer
+		validAddrs := make([]AddrInfo, 0, len(peer.Addrs))
+		for _, addrInfo := range peer.Addrs {
+			if now.Sub(addrInfo.LastSeen) <= timeout {
+				validAddrs = append(validAddrs, addrInfo)
+			}
+		}
+
+		// Si toutes les adresses sont expirées, supprimer le peer
+		if len(validAddrs) == 0 {
+			delete(pm.peers, name)
+		} else {
+			peer.Addrs = validAddrs
 		}
 	}
 }
