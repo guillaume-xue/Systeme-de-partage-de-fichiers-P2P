@@ -53,8 +53,9 @@ type DiskDownloader struct {
 
 	// Cache uniquement pour la STRUCTURE (BigNodes, Dirs).
 	// Les données brutes (Chunks) vont dans tempDir.
-	structureCache   map[[32]byte][]byte
-	structureCacheMu sync.RWMutex
+	structureCache      map[[32]byte][]byte
+	structureCacheSize  int64 // Taille actuelle en bytes
+	structureCacheMu    sync.RWMutex
 
 	// Stats
 	savedFiles   int
@@ -97,9 +98,9 @@ func NewDiskDownloader(server *Server, peer *net.UDPAddr, output string) *DiskDo
 		workQueue:  make(chan task, protocol.MaxQueueSize),
 		responseCh: make(chan [32]byte, protocol.MaxQueueSize),
 
-		pathMap:        make(map[[32]byte]string),
-		bigFiles:       make(map[[32]byte]string),
-		structureCache: make(map[[32]byte][]byte),
+		pathMap:             make(map[[32]byte]string),
+		bigFiles:            make(map[[32]byte]string),
+		structureCache:      make(map[[32]byte][]byte),
 
 		running:      true,
 		done:         make(chan struct{}),
@@ -177,7 +178,14 @@ func (d *DiskDownloader) onDatumReceived(hash [32]byte, data []byte) {
 
 		// Augmenter la fenêtre seulement si réponse rapide
 		if time.Since(start) < d.timeout/2 && d.window < d.maxWindow {
-			d.window++
+			if d.window < d.maxWindow/2 {
+				d.window += 2
+			} else {
+				d.window++
+			}
+			if d.window > d.maxWindow {
+				d.window = d.maxWindow
+			}
 		}
 		delete(d.inflight, hash)
 		delete(d.retries, hash)
@@ -223,48 +231,59 @@ func (d *DiskDownloader) writeTempChunk(hash [32]byte, data []byte) error {
 // WORKER 1 : Envoie les requêtes
 func (d *DiskDownloader) senderLoop() {
 	defer d.wg.Done()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+
 	for d.running {
 		d.pendingMu.Lock()
 		canSend := len(d.inflight) < d.window
 		d.pendingMu.Unlock()
 
 		if !canSend {
-			time.Sleep(10 * time.Millisecond) // Petit wait si surcharge
-			continue
+			select {
+			case <-ticker.C:
+				continue
+			case <-d.done:
+				return
+			}
 		}
 
 		// Récup prochaine tâche
-		tache, ok := <-d.workQueue
-		if !ok {
+		select {
+		case tache, ok := <-d.workQueue:
+			if !ok {
+				return
+			}
+
+			// Check RAM Cache (Structure)
+			d.structureCacheMu.RLock()
+			_, inRam := d.structureCache[tache.hash]
+			d.structureCacheMu.RUnlock()
+
+			// Check Disk Cache (Chunk)
+			inDisk := d.hasTempChunk(tache.hash)
+
+			if inRam || inDisk {
+				// Déjà là, on traite
+				d.processDatum(tache.hash, tache.path)
+				continue
+			}
+
+			// Check si déjà demandé (inflight)
+			d.pendingMu.Lock()
+			if _, sending := d.inflight[tache.hash]; sending {
+				d.pendingMu.Unlock()
+				continue
+			}
+
+			d.trackPath(tache.hash, tache.path)
+			d.inflight[tache.hash] = time.Now()
+			d.pendingMu.Unlock()
+
+			SendDatumRequest(d.server.Conn, d.peer, tache.hash)
+		case <-d.done:
 			return
 		}
-
-		// Check RAM Cache (Structure)
-		d.structureCacheMu.RLock()
-		_, inRam := d.structureCache[tache.hash]
-		d.structureCacheMu.RUnlock()
-
-		// Check Disk Cache (Chunk)
-		inDisk := d.hasTempChunk(tache.hash)
-
-		if inRam || inDisk {
-			// Déjà là, on traite
-			d.processDatum(tache.hash, tache.path)
-			continue
-		}
-
-		// Check si déjà demandé (inflight)
-		d.pendingMu.Lock()
-		if _, sending := d.inflight[tache.hash]; sending {
-			d.pendingMu.Unlock()
-			continue
-		}
-
-		d.trackPath(tache.hash, tache.path)
-		d.inflight[tache.hash] = time.Now()
-		d.pendingMu.Unlock()
-
-		SendDatumRequest(d.server.Conn, d.peer, tache.hash)
 	}
 }
 
@@ -408,10 +427,13 @@ func (d *DiskDownloader) processDatum(hash [32]byte, destPath string) {
 	// 2. Si pas en RAM, essayer sur disque (Chunk)
 	if !inRam {
 		var err error
-		data, err = os.ReadFile(filepath.Join(d.tempDir, fmt.Sprintf("%x", hash)))
+		chunkPath := filepath.Join(d.tempDir, fmt.Sprintf("%x", hash))
+		data, err = os.ReadFile(chunkPath)
 		if err != nil {
 			return // Pas trouvé, on attendra que le receiver le reçoive
 		}
+		// Supprimer le chunk après lecture pour libérer le disque
+		defer os.Remove(chunkPath)
 	}
 
 	typ, content := merkle.ParseDatum(data)

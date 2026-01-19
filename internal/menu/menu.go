@@ -31,10 +31,14 @@ func NewMenu(server *transport.Server, serverAddr *net.UDPAddr) *InteractiveMenu
 	// Détecter les protocols IP locales une seule fois
 	hasIPv4, hasIPv6 := utils.DetectLocalIPProtocol()
 
+	scanner := bufio.NewScanner(os.Stdin)
+	// Limite le buffer à 1MB pour éviter memory spike sur input malveillant
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+
 	return &InteractiveMenu{
 		server:     server,
 		serverAddr: serverAddr,
-		scanner:    bufio.NewScanner(os.Stdin),
+		scanner:    scanner,
 		hasIPv4:    hasIPv4,
 		hasIPv6:    hasIPv6,
 	}
@@ -144,11 +148,13 @@ func (m *InteractiveMenu) connectToPeer() {
 		relayChoice := m.ask("Relais : ")
 		relayChoice = strings.TrimSpace(relayChoice)
 
-		// Configurer le canal de réception AVANT d'envoyer les requêtes NAT
-		// Buffer = nb d'adresses pour éviter de perdre des réponses
-		responseChan := make(chan *net.UDPAddr, max(len(targets), 10))
+		// Configurer les canaux de réception pour chaque adresse cible AVANT d'envoyer les requêtes NAT
+		responseChan := make(chan *net.UDPAddr, max(len(targets)*2, 10))
 		m.server.PingResponseMu.Lock()
-		m.server.PingResponseChan = responseChan
+		// Enregistrer un canal pour chaque adresse cible
+		for _, target := range targets {
+			m.server.PingResponseChans[target.String()] = responseChan
+		}
 		m.server.PingResponseMu.Unlock()
 
 		if relayChoice == "" || relayChoice == "default" {
@@ -158,9 +164,11 @@ func (m *InteractiveMenu) connectToPeer() {
 		fmt.Printf("--- Tentative NAT traversal via %s... ---\n", relayChoice)
 		natPierced, usedAddrs := m.sendNatTraversalViaPeer(targets, relayChoice, responseChan, pName)
 
-		// Cleanup du canal
+		// Cleanup des canaux
 		m.server.PingResponseMu.Lock()
-		m.server.PingResponseChan = nil
+		for _, target := range targets {
+			delete(m.server.PingResponseChans, target.String())
+		}
 		m.server.PingResponseMu.Unlock()
 
 		// Si le NAT est percé, tenter la connexion avec Hello sur les adresses qui ont fonctionné

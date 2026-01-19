@@ -82,10 +82,7 @@ func (pm *PeerManager) GetByAddr(addr *net.UDPAddr) (*PeerInfo, bool) {
 
 	for _, peer := range pm.peers {
 		for _, peerAddr := range peer.Addrs {
-			if peerAddr.Port != addr.Port {
-				continue
-			}
-			if peerAddr.IP.Equal(addr.IP) {
+			if peerAddr.IP.Equal(addr.IP) && peerAddr.Port == addr.Port {
 				return peer, true
 			}
 		}
@@ -111,6 +108,10 @@ func (pm *PeerManager) CleanExpired() {
 func (pm *PeerManager) List() []string {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
+
+	if len(pm.peers) == 0 {
+		return []string{}
+	}
 
 	list := make([]string, 0, len(pm.peers))
 	for name := range pm.peers {

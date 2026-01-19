@@ -31,31 +31,33 @@ type Server struct {
 	rootHashChan    chan [32]byte // Canal temporaire pour recevoir la réponse "Root"
 	rootHashMu      sync.Mutex
 
-	// Canal pour détecter les réceptions pendant pingSpam
-	PingResponseChan chan *net.UDPAddr
-	PingResponseMu   sync.Mutex
+	// Canaux pour détecter les réceptions pendant pingSpam (par adresse cible)
+	PingResponseChans map[string]chan *net.UDPAddr
+	PingResponseMu    sync.Mutex
 
 	// Cache HTTP pour éviter de spammer l'annuaire
 	keyCache   map[string][]byte
 	keyCacheMu sync.RWMutex
 
 	workerSem chan struct{}
+	workerWg  sync.WaitGroup
 
 	shutdown chan struct{}
 }
 
 func NewServer(conn *net.UDPConn, key *ecdsa.PrivateKey, name string) *Server {
 	return &Server{
-		Conn:            conn,
-		PrivKey:         key,
-		MyName:          name,
-		PeerManager:     peer.NewPeerManager(),
-		MerkleStore:     merkle.NewStore(),
-		Downloads:       merkle.NewStore(),
-		DatumDispatcher: NewDatumDispatcher(),
-		keyCache:        make(map[string][]byte),
-		workerSem:       make(chan struct{}, 100), // Limite à 100 workers concurrents
-		shutdown:        make(chan struct{}),
+		Conn:              conn,
+		PrivKey:           key,
+		MyName:            name,
+		PeerManager:       peer.NewPeerManager(),
+		MerkleStore:       merkle.NewStore(),
+		Downloads:         merkle.NewStore(),
+		DatumDispatcher:   NewDatumDispatcher(),
+		keyCache:          make(map[string][]byte),
+		PingResponseChans: make(map[string]chan *net.UDPAddr),
+		workerSem:         make(chan struct{}, 100), // Limite à 100 workers concurrents
+		shutdown:          make(chan struct{}),
 	}
 }
 
@@ -69,16 +71,27 @@ func (s *Server) ListenLoop(ctx context.Context) {
 			continue
 		}
 
+		// Validation rapide du header AVANT copie (optimisation)
+		if n < protocol.HeaderSize {
+			continue // Paquet trop court, on ignore
+		}
+
 		// Copie nécessaire car buf est écrasé à la prochaine itération
 		packetData := make([]byte, n)
 		copy(packetData, buf[:n])
 
 		select {
 		case s.workerSem <- struct{}{}:
+			s.workerWg.Add(1)
 			go func() {
-				defer func() { <-s.workerSem }() // Libérer le semaphore
+				defer func() {
+					<-s.workerSem // Libérer le semaphore
+					s.workerWg.Done()
+				}()
 				s.handlePacket(remote, packetData)
 			}()
+		case <-time.After(100 * time.Millisecond):
+			// Trop de workers, on drop le packet
 		case <-ctx.Done():
 			return
 		case <-s.shutdown:
@@ -87,9 +100,10 @@ func (s *Server) ListenLoop(ctx context.Context) {
 	}
 }
 
-// Stop ferme tout
+// Stop ferme tout proprement
 func (s *Server) Stop() {
 	close(s.shutdown)
+	s.workerWg.Wait() // Attendre que tous les workers terminent
 	s.Conn.Close()
 }
 
@@ -114,15 +128,15 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 
 	// Notifier les listeners de pingSpam qu'on a reçu quelque chose
 	s.PingResponseMu.Lock()
-	if s.PingResponseChan != nil {
+	for _, ch := range s.PingResponseChans {
 		select {
-		case s.PingResponseChan <- addr:
+		case ch <- addr:
 		default:
 		}
 	}
 	s.PingResponseMu.Unlock()
 
-	if p, ok := s.PeerManager.GetByAddr(addr); ok {
+	if p, ok := s.PeerManager.GetByAddr(addr); ok && p != nil {
 		s.PeerManager.AddOrUpdate(p.Name, addr, p.PublicKey, p.IsRelay)
 	}
 
@@ -367,17 +381,18 @@ func (s *Server) onNatRequest2(pkt *protocol.Packet, relayAddr *net.UDPAddr) {
 	SendOk(s.Conn, relayAddr, pkt.Header.ID)
 
 	srcAddr := srcStruct.ToUDPAddr()
-	fmt.Printf("🔀 NAT: %s nous demande de pinguer %s\n", relayAddr, srcAddr)
+	srcAddrKey := srcAddr.String() // Cache une seule fois
+	fmt.Printf("🔀 NAT: %s nous demande de pinguer %s\n", relayAddr, srcAddrKey)
 
 	// Créer un canal pour détecter les réceptions de cette adresse
 	responseChan := make(chan *net.UDPAddr, 10)
 	s.PingResponseMu.Lock()
-	s.PingResponseChan = responseChan
+	s.PingResponseChans[srcAddrKey] = responseChan
 	s.PingResponseMu.Unlock()
 
 	defer func() {
 		s.PingResponseMu.Lock()
-		s.PingResponseChan = nil
+		delete(s.PingResponseChans, srcAddrKey)
 		s.PingResponseMu.Unlock()
 	}()
 
@@ -393,7 +408,7 @@ func (s *Server) onNatRequest2(pkt *protocol.Packet, relayAddr *net.UDPAddr) {
 		for {
 			select {
 			case receivedAddr := <-responseChan:
-				if receivedAddr.String() == srcAddr.String() {
+				if receivedAddr.String() == srcAddrKey {
 					close(stopSending) // Signaler l'arrêt
 					select {
 					case success <- true:
@@ -508,29 +523,17 @@ func (s *Server) KeepAlive(serverAddr *net.UDPAddr, interval time.Duration, ctx 
 			return
 		case <-ticker.C:
 			fmt.Println()
-			// 1. Ping le serveur central (IPv4 et v6 si dispo)
-			// On force la ré-résolution pour gérer le changement d'IP DNS éventuel
-			if addr, err := net.ResolveUDPAddr("udp", protocol.GetServerUDPv6()); err == nil {
-				SendPing(s.Conn, addr)
-				time.Sleep(1 * time.Microsecond) // Délai pour garantir un ID unique
-			}
-			if addr, err := net.ResolveUDPAddr("udp", protocol.GetServerUDPv4()); err == nil {
-				SendPing(s.Conn, addr)
-				time.Sleep(1 * time.Microsecond)
-			}
-
-			// 2. Ping tous les pairs connectés (toutes leurs adresses)
 			connectedPeers := s.PeerManager.List()
-			for _, peerName := range connectedPeers {
-				if peerInfo, ok := s.PeerManager.Get(peerName); ok && peerInfo.Name != "jch.irif.fr" {
-					for _, addr := range peerInfo.Addrs {
-						SendPing(s.Conn, addr)
-						time.Sleep(1 * time.Microsecond)
+			if len(connectedPeers) > 0 {
+				for _, peerName := range connectedPeers {
+					if peerInfo, ok := s.PeerManager.Get(peerName); ok {
+						for _, addr := range peerInfo.Addrs {
+							SendPing(s.Conn, addr)
+							time.Sleep(1 * time.Millisecond)
+						}
 					}
 				}
 			}
-
-			// 3. Nettoyage
 			s.PeerManager.CleanExpired()
 		}
 	}
