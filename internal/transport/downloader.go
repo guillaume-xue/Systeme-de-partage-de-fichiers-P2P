@@ -171,16 +171,9 @@ func (d *Downloader) responseLoop() {
 		d.mu.Lock()
 		sentAt, ok := d.pending[hash]
 		if ok {
-			// Succès ! Incrémenter le compteur
-			d.successCount++
-			d.failureCount = 0 // Reset les échecs
-
-			// Augmenter la fenêtre seulement si réponse rapide
-			if time.Since(sentAt) < d.timeout/2 && d.windowSize < d.maxWindowSize {
-				d.windowSize++
-			}
-			delete(d.pending, hash)
-			delete(d.retries, hash)
+			responseTime := time.Since(sentAt)
+			d.adjustWindowOnSuccessDownloader(responseTime)
+			d.removeFromPendingDownloader(hash)
 		}
 		d.mu.Unlock()
 
@@ -256,13 +249,7 @@ func (d *Downloader) monitorLoop() {
 		}
 
 		if timeoutDetected {
-			d.failureCount++
-			d.successCount = 0
-			if d.failureCount > 2 && d.windowSize > d.minWindowSize {
-				newWin := (d.windowSize * 3) / 5
-				d.windowSize = utils.MaxInt(newWin, d.minWindowSize)
-				d.failureCount = 0
-			}
+			d.adjustWindowOnFailure()
 		}
 		d.mu.Unlock()
 
@@ -301,4 +288,32 @@ func (d *Downloader) queueHash(h [32]byte) {
 	default:
 		// fmt.Println("Queue full!")
 	}
+}
+
+// adjustWindowOnSuccessDownloader ajuste la fenêtre après un succès
+func (d *Downloader) adjustWindowOnSuccessDownloader(responseTime time.Duration) {
+	d.successCount++
+	d.failureCount = 0
+
+	if responseTime < d.timeout/2 && d.windowSize < d.maxWindowSize {
+		d.windowSize++
+	}
+}
+
+// adjustWindowOnFailure réduit la fenêtre après des échecs
+func (d *Downloader) adjustWindowOnFailure() {
+	d.failureCount++
+	d.successCount = 0
+
+	if d.failureCount > 2 && d.windowSize > d.minWindowSize {
+		newWin := (d.windowSize * 3) / 5
+		d.windowSize = utils.MaxInt(newWin, d.minWindowSize)
+		d.failureCount = 0
+	}
+}
+
+// removeFromPendingDownloader retire un hash de pending et retries
+func (d *Downloader) removeFromPendingDownloader(hash [32]byte) {
+	delete(d.pending, hash)
+	delete(d.retries, hash)
 }

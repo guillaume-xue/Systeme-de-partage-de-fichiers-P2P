@@ -53,9 +53,9 @@ type DiskDownloader struct {
 
 	// Cache uniquement pour la STRUCTURE (BigNodes, Dirs).
 	// Les données brutes (Chunks) vont dans tempDir.
-	structureCache      map[[32]byte][]byte
-	structureCacheSize  int64 // Taille actuelle en bytes
-	structureCacheMu    sync.RWMutex
+	structureCache     map[[32]byte][]byte
+	structureCacheSize int64 // Taille actuelle en bytes
+	structureCacheMu   sync.RWMutex
 
 	// Stats
 	savedFiles   int
@@ -73,6 +73,9 @@ type DiskDownloader struct {
 
 	// Semaphore pour limiter les goroutines de processing
 	processorSem chan struct{}
+	// Compteur de goroutines actives dans le processor
+	processingCount int
+	processingMu    sync.Mutex
 }
 
 func NewDiskDownloader(server *Server, peer *net.UDPAddr, output string) *DiskDownloader {
@@ -98,9 +101,9 @@ func NewDiskDownloader(server *Server, peer *net.UDPAddr, output string) *DiskDo
 		workQueue:  make(chan task, protocol.MaxQueueSize),
 		responseCh: make(chan [32]byte, protocol.MaxQueueSize),
 
-		pathMap:             make(map[[32]byte]string),
-		bigFiles:            make(map[[32]byte]string),
-		structureCache:      make(map[[32]byte][]byte),
+		pathMap:        make(map[[32]byte]string),
+		bigFiles:       make(map[[32]byte]string),
+		structureCache: make(map[[32]byte][]byte),
 
 		running:      true,
 		done:         make(chan struct{}),
@@ -172,25 +175,13 @@ func (d *DiskDownloader) onDatumReceived(hash [32]byte, data []byte) {
 	// retirer de inflight tds pour éviter les faux timeouts
 	d.pendingMu.Lock()
 	start, wasInflight := d.inflight[hash]
-	if wasInflight {
-		d.successCount++
-		d.failureCount = 0
-
-		// Augmenter la fenêtre seulement si réponse rapide
-		if time.Since(start) < d.timeout/2 && d.window < d.maxWindow {
-			if d.window < d.maxWindow/2 {
-				d.window += 2
-			} else {
-				d.window++
-			}
-			if d.window > d.maxWindow {
-				d.window = d.maxWindow
-			}
-		}
-		delete(d.inflight, hash)
-		delete(d.retries, hash)
-	}
 	d.pendingMu.Unlock()
+
+	if wasInflight {
+		responseTime := time.Since(start)
+		d.adjustWindowOnSuccess(responseTime)
+		d.removeFromInflight(hash)
+	}
 
 	// On détermine si c'est un Chunk (Data) ou une Structure (Node)
 	typ, _ := merkle.ParseDatum(data)
@@ -220,12 +211,8 @@ func (d *DiskDownloader) onDatumReceived(hash [32]byte, data []byte) {
 
 // writeTempChunk écrit un chunk sur le disque dans le dossier temp
 func (d *DiskDownloader) writeTempChunk(hash [32]byte, data []byte) error {
-	// On encode le hash en hex pour le nom de fichier
-	filename := fmt.Sprintf("%x", hash)
-	path := filepath.Join(d.tempDir, filename)
-
 	// Ici on écrit tout le data (header inclu).
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(d.getTempChunkPath(hash), data, 0644)
 }
 
 // WORKER 1 : Envoie les requêtes
@@ -255,15 +242,7 @@ func (d *DiskDownloader) senderLoop() {
 				return
 			}
 
-			// Check RAM Cache (Structure)
-			d.structureCacheMu.RLock()
-			_, inRam := d.structureCache[tache.hash]
-			d.structureCacheMu.RUnlock()
-
-			// Check Disk Cache (Chunk)
-			inDisk := d.hasTempChunk(tache.hash)
-
-			if inRam || inDisk {
+			if d.hasDatum(tache.hash) {
 				// Déjà là, on traite
 				d.processDatum(tache.hash, tache.path)
 				continue
@@ -288,10 +267,116 @@ func (d *DiskDownloader) senderLoop() {
 }
 
 func (d *DiskDownloader) hasTempChunk(hash [32]byte) bool {
-	filename := fmt.Sprintf("%x", hash)
-	path := filepath.Join(d.tempDir, filename)
-	_, err := os.Stat(path)
+	_, err := os.Stat(d.getTempChunkPath(hash))
 	return err == nil
+}
+
+// getTempChunkPath retourne le chemin d'un chunk temporaire
+func (d *DiskDownloader) getTempChunkPath(hash [32]byte) string {
+	return filepath.Join(d.tempDir, fmt.Sprintf("%x", hash))
+}
+
+// readDatum lit un datum depuis la RAM (structure) ou le disque (chunk)
+func (d *DiskDownloader) readDatum(hash [32]byte) ([]byte, bool) {
+	// 1. Essayer RAM
+	d.structureCacheMu.RLock()
+	data, inRam := d.structureCache[hash]
+	d.structureCacheMu.RUnlock()
+
+	if inRam {
+		return data, true
+	}
+
+	// 2. Essayer disque
+	data, err := os.ReadFile(d.getTempChunkPath(hash))
+	if err != nil {
+		return nil, false
+	}
+
+	return data, true
+}
+
+// hasDatum vérifie si un datum existe en RAM ou sur disque
+func (d *DiskDownloader) hasDatum(hash [32]byte) bool {
+	// Check RAM
+	d.structureCacheMu.RLock()
+	_, inRam := d.structureCache[hash]
+	d.structureCacheMu.RUnlock()
+
+	if inRam {
+		return true
+	}
+
+	// Check Disque
+	return d.hasTempChunk(hash)
+}
+
+// recordSuccess enregistre un fichier sauvegardé avec sa taille
+func (d *DiskDownloader) recordSuccess(size int64) {
+	d.statsMu.Lock()
+	d.savedFiles++
+	d.savedBytes += size
+	d.statsMu.Unlock()
+}
+
+// adjustWindowOnSuccess ajuste la fenêtre après un succès
+func (d *DiskDownloader) adjustWindowOnSuccess(responseTime time.Duration) {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+
+	d.successCount++
+	d.failureCount = 0
+
+	// Augmenter la fenêtre seulement si réponse rapide
+	if responseTime < d.timeout/2 && d.window < d.maxWindow {
+		if d.window < d.maxWindow/2 {
+			d.window += 2
+		} else {
+			d.window++
+		}
+		if d.window > d.maxWindow {
+			d.window = d.maxWindow
+		}
+	}
+}
+
+// removeFromInflight retire un hash de la liste inflight et retourne son timestamp
+func (d *DiskDownloader) removeFromInflight(hash [32]byte) time.Time {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+
+	start := d.inflight[hash]
+	delete(d.inflight, hash)
+	delete(d.retries, hash)
+	return start
+}
+
+// getCompletionStatus retourne les compteurs pour la détection de fin
+func (d *DiskDownloader) getCompletionStatus() (inflight, queued, response, processing int) {
+	d.pendingMu.Lock()
+	inflight = len(d.inflight)
+	queued = len(d.workQueue)
+	response = len(d.responseCh)
+	d.pendingMu.Unlock()
+
+	d.processingMu.Lock()
+	processing = d.processingCount
+	d.processingMu.Unlock()
+
+	return
+}
+
+// isDownloadComplete vérifie si le téléchargement est terminé
+func (d *DiskDownloader) isDownloadComplete() bool {
+	inflight, queued, response, processing := d.getCompletionStatus()
+	return inflight == 0 && queued == 0 && response == 0 && processing == 0
+}
+
+// getStats retourne les statistiques de téléchargement
+func (d *DiskDownloader) getStats() (files int, bytes int64) {
+	d.statsMu.Lock()
+	defer d.statsMu.Unlock()
+	return d.savedFiles, d.savedBytes
 }
 
 func (d *DiskDownloader) trackPath(hash [32]byte, p string) {
@@ -316,9 +401,19 @@ func (d *DiskDownloader) processorLoop() {
 		// Acquérir le semaphore (ou attendre qu'un slot se libère)
 		d.processorSem <- struct{}{}
 
+		// Incrémenter le compteur de processing actif
+		d.processingMu.Lock()
+		d.processingCount++
+		d.processingMu.Unlock()
+
 		// Traiter en parallèle
 		go func(h [32]byte) {
-			defer func() { <-d.processorSem }() // Libérer le semaphore
+			defer func() {
+				<-d.processorSem // Libérer le semaphore
+				d.processingMu.Lock()
+				d.processingCount--
+				d.processingMu.Unlock()
+			}()
 
 			path := d.getPath(h)
 			d.processDatum(h, path)
@@ -340,75 +435,31 @@ func (d *DiskDownloader) monitorLoop() {
 	for d.running {
 		<-tick.C
 
+		inflight, queued, response, processing := d.getCompletionStatus()
 		d.pendingMu.Lock()
-		inflightCount := len(d.inflight)
-		queuedCount := len(d.workQueue)
 		windowSize := d.window
 		d.pendingMu.Unlock()
 
 		// Affichage des stats
-		d.statsMu.Lock()
-		savedFiles := d.savedFiles
-		savedBytes := d.savedBytes
-		d.statsMu.Unlock()
+		savedFiles, savedBytes := d.getStats()
 
 		fmt.Printf("\r%-100s\r", "") // Nettoyer la ligne
 		fmt.Printf("💾 Téléchargement: (%d fichiers, %s) | En cours: %d | File: %d | Fenêtre: %d",
-			savedFiles, utils.FormatBytesInt64(savedBytes), inflightCount, queuedCount, windowSize)
-
-		d.pendingMu.Lock()
+			savedFiles, utils.FormatBytesInt64(savedBytes), inflight, queued, windowSize)
 
 		// Logique de fin
-		if inflightCount == 0 && queuedCount == 0 {
+		if inflight == 0 && queued == 0 && response == 0 && processing == 0 {
 			// Petite vérif double
-			d.pendingMu.Unlock()
 			time.Sleep(200 * time.Millisecond)
-			d.pendingMu.Lock()
-			if len(d.inflight) == 0 && len(d.workQueue) == 0 {
+			if d.isDownloadComplete() {
 				fmt.Println()
-				d.pendingMu.Unlock()
 				close(d.done)
 				return
 			}
 		}
 
 		// Gestion des timeouts
-		now := time.Now()
-		timeoutCount := 0
-		var retryList [][32]byte
-
-		for hash, sentAt := range d.inflight {
-			if now.Sub(sentAt) > d.timeout {
-				timeoutCount++
-				d.retries[hash]++
-				if d.retries[hash] > 3 {
-					// Trop d'échecs, on abandonne ce chunk
-					fmt.Printf("\n⚠️ Abandon définitif chunk %x\n", hash)
-					delete(d.inflight, hash)
-					delete(d.retries, hash)
-				} else {
-					// Retry - ajouter à la liste pour renvoyer après avoir relâché le lock
-					retryList = append(retryList, hash)
-					d.inflight[hash] = now // Reset timer
-				}
-			}
-		}
-
-		// Ajuster la fenêtre seulement si taux d'échec significatif
-		// Ne pas pénaliser pour quelques timeouts isolés
-		if timeoutCount > 0 {
-			d.failureCount += timeoutCount
-			d.successCount = 0
-
-			// Diminuer la fenêtre seulement si échecs répétés
-			// Seuil à 2 pour réagir plus vite
-			if d.failureCount > 2 && d.window > d.minWindow {
-				d.window = utils.MaxInt((d.window*3)/5, d.minWindow) // -40%
-				d.failureCount = 0
-			}
-		}
-
-		d.pendingMu.Unlock()
+		retryList := d.handleTimeouts()
 
 		// Retransmission
 		for _, hash := range retryList {
@@ -417,23 +468,51 @@ func (d *DiskDownloader) monitorLoop() {
 	}
 }
 
+// handleTimeouts gère les timeouts et retourne la liste des hashs à retransmettre
+func (d *DiskDownloader) handleTimeouts() [][32]byte {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+
+	now := time.Now()
+	timeoutCount := 0
+	var retryList [][32]byte
+
+	for hash, sentAt := range d.inflight {
+		if now.Sub(sentAt) > d.timeout {
+			timeoutCount++
+			d.retries[hash]++
+			if d.retries[hash] > 3 {
+				// Trop d'échecs, on abandonne ce chunk
+				fmt.Printf("\n⚠️ Abandon définitif chunk %x\n", hash)
+				delete(d.inflight, hash)
+				delete(d.retries, hash)
+			} else {
+				// Retry - ajouter à la liste pour renvoyer
+				retryList = append(retryList, hash)
+				d.inflight[hash] = now // Reset timer
+			}
+		}
+	}
+
+	// Ajuster la fenêtre seulement si taux d'échec significatif
+	if timeoutCount > 0 {
+		d.failureCount += timeoutCount
+		d.successCount = 0
+
+		if d.failureCount > 2 && d.window > d.minWindow {
+			d.window = utils.MaxInt((d.window*3)/5, d.minWindow) // -40%
+			d.failureCount = 0
+		}
+	}
+
+	return retryList
+}
+
 // Traitement d'un datum reçu
 func (d *DiskDownloader) processDatum(hash [32]byte, destPath string) {
-	// 1. Essayer de lire en RAM (Structure)
-	d.structureCacheMu.RLock()
-	data, inRam := d.structureCache[hash]
-	d.structureCacheMu.RUnlock()
-
-	// 2. Si pas en RAM, essayer sur disque (Chunk)
-	if !inRam {
-		var err error
-		chunkPath := filepath.Join(d.tempDir, fmt.Sprintf("%x", hash))
-		data, err = os.ReadFile(chunkPath)
-		if err != nil {
-			return // Pas trouvé, on attendra que le receiver le reçoive
-		}
-		// Supprimer le chunk après lecture pour libérer le disque
-		defer os.Remove(chunkPath)
+	data, found := d.readDatum(hash)
+	if !found {
+		return // Pas trouvé, on attendra que le receiver le reçoive
 	}
 
 	typ, content := merkle.ParseDatum(data)
@@ -473,10 +552,7 @@ func (d *DiskDownloader) processDatum(hash [32]byte, destPath string) {
 			// On écrit le contenu
 			err := os.WriteFile(destPath, content, 0644)
 			if err == nil {
-				d.statsMu.Lock()
-				d.savedFiles++
-				d.savedBytes += int64(len(content))
-				d.statsMu.Unlock()
+				d.recordSuccess(int64(len(content)))
 			}
 		}
 
@@ -520,10 +596,7 @@ func (d *DiskDownloader) finalizeBigFiles() {
 		outFile.Close()
 
 		if err == nil {
-			d.statsMu.Lock()
-			d.savedFiles++
-			d.savedBytes += size
-			d.statsMu.Unlock()
+			d.recordSuccess(size)
 			fmt.Printf("✅ (%s)\n", utils.FormatBytesInt64(size))
 		} else {
 			fmt.Printf("❌ Echec: %v\n", err)
@@ -558,11 +631,14 @@ func (d *DiskDownloader) assembleStream(hash [32]byte, writer io.Writer) (int64,
 	}
 
 	// Si pas en RAM, c'est un Chunk sur disque (Temp)
-	chunkPath := filepath.Join(d.tempDir, fmt.Sprintf("%x", hash))
+	chunkPath := d.getTempChunkPath(hash)
 	chunkData, err := os.ReadFile(chunkPath)
 	if err != nil {
 		return 0, fmt.Errorf("chunk manquant: %x", hash)
 	}
+
+	// Supprimer le chunk après lecture pour libérer l'espace disque
+	defer os.Remove(chunkPath)
 
 	_, content := merkle.ParseDatum(chunkData)
 

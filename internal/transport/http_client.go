@@ -26,19 +26,13 @@ var httpClient = &http.Client{
 
 // GetListPeers récupère la liste des noms enregistrés
 func GetListPeers() ([]string, error) {
-	resp, err := httpClient.Get(protocol.GetURL())
+	body, status, err := httpGetWithTimeout(protocol.GetURL())
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("bad status: %s", resp.Status)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	if status != 200 {
+		return nil, fmt.Errorf("bad status: %d", status)
 	}
 
 	// Parsing simple : une ligne = un peer
@@ -54,18 +48,26 @@ func GetListPeers() ([]string, error) {
 	return peers, nil
 }
 
-// GetAddr récupère la string des adresses d'un peer
-func GetAddr(name string) (string, error) {
-	// Construction d'URL
-	url := protocol.GetURL() + name + "/addresses"
-
+// httpGetWithTimeout effectue une requête GET avec timeout et gestion d'erreur
+func httpGetWithTimeout(url string) ([]byte, int, error) {
 	resp, err := httpClient.Get(url)
 	if err != nil {
-		return "", err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, err
+	}
+
+	return body, resp.StatusCode, nil
+}
+
+// GetAddr récupère la string des adresses d'un peer
+func GetAddr(name string) (string, error) {
+	url := protocol.GetURL() + name + "/addresses"
+	body, _, err := httpGetWithTimeout(url)
 	if err != nil {
 		return "", err
 	}
@@ -75,18 +77,16 @@ func GetAddr(name string) (string, error) {
 // GetKey récupère la clé publique brute (64 bytes)
 func GetKey(name string) ([]byte, error) {
 	url := protocol.GetURL() + name + "/key"
-
-	resp, err := httpClient.Get(url)
+	body, status, err := httpGetWithTimeout(url)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode == 404 {
+	if status == 404 {
 		return nil, fmt.Errorf("peer not found")
 	}
 
-	return io.ReadAll(resp.Body)
+	return body, nil
 }
 
 // RegisterHTTP publie notre clé publique sur l'annuaire
