@@ -138,7 +138,7 @@ func (m *InteractiveMenu) connectToPeer() {
 	targetIPv4, targetIPv6 := utils.SeperateAddressesByProtocol(targets)
 	var remainingTargets []*net.UDPAddr
 
-	peerInfo, exists := m.server.PeerManager.Get(pName)
+	peerInfo, exists := m.server.Manager.Get(pName)
 	if exists {
 		// Vérifier quels protocoles manquent
 		hasIPv4, hasIPv6 := false, false
@@ -198,7 +198,7 @@ func (m *InteractiveMenu) connectToPeer() {
 	}
 
 	// Vérifier le résultat final
-	peerInfo, exists = m.server.PeerManager.Get(pName)
+	peerInfo, exists = m.server.Manager.Get(pName)
 	if exists {
 		fmt.Printf("✅ SUCCÈS : Connecté à %s avec %d adresse(s) !\n", pName, len(peerInfo.Addrs))
 	} else {
@@ -265,7 +265,7 @@ func (m *InteractiveMenu) downloadManual(ctx context.Context) {
 
 // 5. Affichage des connexions
 func (m *InteractiveMenu) showConnections() {
-	connectedPeers := m.server.PeerManager.List()
+	connectedPeers := m.server.Manager.List()
 
 	fmt.Println("\n🔗 Peers connectés:")
 
@@ -273,7 +273,7 @@ func (m *InteractiveMenu) showConnections() {
 		fmt.Println("	Aucun peer connecté")
 	} else {
 		for _, pName := range connectedPeers {
-			info, _ := m.server.PeerManager.Get(pName)
+			info, _ := m.server.Manager.Get(pName)
 			fmt.Printf("\n  - %s\n", pName)
 			for i, addrInfo := range info.Addrs {
 				fmt.Printf("	Adresse %d: %s\n", i+1, addrInfo.Addr)
@@ -332,7 +332,7 @@ func (m *InteractiveMenu) sendDirectConnection(addresses []*net.UDPAddr, pName s
 	}
 
 	// Vérifier si le peer existe et a été vu récemment
-	if peerInfo, exists := m.server.PeerManager.Get(pName); exists {
+	if peerInfo, exists := m.server.Manager.Get(pName); exists {
 		if peerInfo.LastSeen.After(startTime) {
 			return true
 		}
@@ -343,7 +343,7 @@ func (m *InteractiveMenu) sendDirectConnection(addresses []*net.UDPAddr, pName s
 // sendNatTraversalViaPeer utilise un pair comme relais pour le NAT traversal
 func (m *InteractiveMenu) sendNatTraversalViaPeer(targetAddresses []*net.UDPAddr, relayPeerName string, responseChan chan *net.UDPAddr) bool {
 	// Vérifier que le peer relais est connecté
-	relayPeer, exists := m.server.PeerManager.Get(relayPeerName)
+	relayPeer, exists := m.server.Manager.Get(relayPeerName)
 	if !exists {
 		fmt.Printf("❌ Peer relais %s non connecté. Vous devez d'abord être connecté avec ce peer.\n", relayPeerName)
 		return false
@@ -474,7 +474,7 @@ func (m *InteractiveMenu) pingSpam(addresses []*net.UDPAddr, count int, response
 
 // Helper pour choisir un peer connecté
 func (m *InteractiveMenu) pickConnectedPeer() (*peer.PeerInfo, string) {
-	connectedPeers := m.server.PeerManager.List()
+	connectedPeers := m.server.Manager.List()
 	if len(connectedPeers) == 0 {
 		fmt.Println("Aucun peer connecté (utilisez l'option 2).")
 		return nil, ""
@@ -489,11 +489,11 @@ func (m *InteractiveMenu) pickConnectedPeer() (*peer.PeerInfo, string) {
 
 	// Support choix par index
 	if peerIndex, err := strconv.Atoi(peerChoice); err == nil && peerIndex > 0 && peerIndex <= len(connectedPeers) {
-		pInfo, _ := m.server.PeerManager.Get(connectedPeers[peerIndex-1])
+		pInfo, _ := m.server.Manager.Get(connectedPeers[peerIndex-1])
 		return pInfo, connectedPeers[peerIndex-1]
 	}
 	// Support choix par nom
-	if pInfo, ok := m.server.PeerManager.Get(peerChoice); ok {
+	if pInfo, ok := m.server.Manager.Get(peerChoice); ok {
 		return pInfo, peerChoice
 	} else {
 		fmt.Printf("Peer '%s' non connecté\n", peerChoice)

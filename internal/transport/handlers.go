@@ -2,110 +2,15 @@ package transport
 
 import (
 	"context"
-	"crypto/ecdsa"
 	"crypto/sha256"
 	"fmt"
 	"main/internal/crypto"
 	"main/internal/merkle"
-	"main/internal/peer"
 	"main/internal/protocol"
 	"main/internal/utils"
 	"net"
-	"sync"
 	"time"
 )
-
-type Server struct {
-	Conn    *net.UDPConn
-	PrivKey *ecdsa.PrivateKey
-	MyName  string
-
-	// Composants internes
-	PeerManager *peer.PeerManager
-	MerkleStore *merkle.Store // Fichiers locaux
-	Downloads   *merkle.Store // Fichiers distants
-	RootHash    [32]byte
-
-	// Events
-	DatumDispatcher *DatumDispatcher
-	rootHashChan    chan [32]byte // Canal temporaire pour recevoir la réponse "Root"
-	rootHashMu      sync.Mutex
-
-	// Canaux pour détecter les réceptions pendant pingSpam (par adresse cible)
-	PingResponseChans map[string]chan *net.UDPAddr
-	PingResponseMu    sync.Mutex
-
-	// Cache HTTP pour éviter de spammer l'annuaire
-	keyCache   map[string][]byte
-	keyCacheMu sync.RWMutex
-
-	workerSem chan struct{}
-	workerWg  sync.WaitGroup
-
-	shutdown chan struct{}
-}
-
-func NewServer(conn *net.UDPConn, key *ecdsa.PrivateKey, name string) *Server {
-	return &Server{
-		Conn:              conn,
-		PrivKey:           key,
-		MyName:            name,
-		PeerManager:       peer.NewPeerManager(),
-		MerkleStore:       merkle.NewStore(),
-		Downloads:         merkle.NewStore(),
-		DatumDispatcher:   NewDatumDispatcher(),
-		keyCache:          make(map[string][]byte),
-		PingResponseChans: make(map[string]chan *net.UDPAddr),
-		workerSem:         make(chan struct{}, 100), // Limite à 100 workers concurrents
-		shutdown:          make(chan struct{}),
-	}
-}
-
-// ListenLoop : Boucle principale
-func (s *Server) ListenLoop(ctx context.Context) {
-	buf := make([]byte, 65535) // max buffer
-
-	for {
-		n, remote, err := s.Conn.ReadFromUDP(buf)
-		if err != nil {
-			continue
-		}
-
-		// Validation rapide du header AVANT copie (optimisation)
-		if n < protocol.HeaderSize {
-			continue // Paquet trop court, on ignore
-		}
-
-		// Copie nécessaire car buf est écrasé à la prochaine itération
-		packetData := make([]byte, n)
-		copy(packetData, buf[:n])
-
-		select {
-		case s.workerSem <- struct{}{}:
-			s.workerWg.Add(1)
-			go func() {
-				defer func() {
-					<-s.workerSem // Libérer le semaphore
-					s.workerWg.Done()
-				}()
-				s.handlePacket(remote, packetData)
-			}()
-		case <-time.After(100 * time.Millisecond):
-			// Trop de workers, on drop le packet
-		case <-ctx.Done():
-			return
-		case <-s.shutdown:
-			return
-		}
-	}
-}
-
-// Stop ferme tout proprement
-func (s *Server) Stop() {
-	close(s.shutdown)
-	s.workerWg.Wait() // Attendre que tous les workers terminent
-	s.Conn.Close()
-}
 
 // handlePacket : Le gros switch de dispatch
 func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
@@ -136,8 +41,8 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 	}
 	s.PingResponseMu.Unlock()
 
-	if p, ok := s.PeerManager.GetByAddr(addr); ok && p != nil {
-		s.PeerManager.AddOrUpdate(p.Name, addr, p.PublicKey, p.IsRelay)
+	if p, ok := s.Manager.GetByAddr(addr); ok && p != nil {
+		s.Manager.AddOrUpdate(p.Name, addr, p.PublicKey, p.IsRelay)
 	}
 
 	// Dispatch selon le type
@@ -156,7 +61,7 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 
 	// --- MERKLE TREE ---
 	case protocol.RootRequest:
-		if _, ok := s.PeerManager.GetByAddr(addr); !ok {
+		if _, ok := s.Manager.GetByAddr(addr); !ok {
 			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
 			return
 		}
@@ -164,21 +69,21 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 		SendRootReply(s.Conn, addr, s.RootHash, s.PrivKey, pkt.Header.ID)
 
 	case protocol.RootReply:
-		if _, ok := s.PeerManager.GetByAddr(addr); !ok {
+		if _, ok := s.Manager.GetByAddr(addr); !ok {
 			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
 			return
 		}
 		s.onRootReply(pkt, addr)
 
 	case protocol.DatumRequest:
-		if _, ok := s.PeerManager.GetByAddr(addr); !ok {
+		if _, ok := s.Manager.GetByAddr(addr); !ok {
 			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
 			return
 		}
 		s.onDatumRequest(pkt, addr)
 
 	case protocol.Datum:
-		if _, ok := s.PeerManager.GetByAddr(addr); !ok {
+		if _, ok := s.Manager.GetByAddr(addr); !ok {
 			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
 			return
 		}
@@ -190,7 +95,7 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 
 	// --- NAT TRAVERSAL ---
 	case protocol.NatTraversalRequest:
-		if _, ok := s.PeerManager.GetByAddr(addr); !ok {
+		if _, ok := s.Manager.GetByAddr(addr); !ok {
 			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
 			return
 		}
@@ -198,7 +103,7 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 		s.onNatRequest(pkt, addr)
 
 	case protocol.NatTraversalRequest2:
-		if _, ok := s.PeerManager.GetByAddr(addr); !ok {
+		if _, ok := s.Manager.GetByAddr(addr); !ok {
 			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
 			return
 		}
@@ -241,7 +146,7 @@ func (s *Server) onHello(pkt *protocol.Packet, addr *net.UDPAddr, isReply bool) 
 	isRelay := (extensions & protocol.ExtNatTraversalRelay) != 0
 
 	// 3. Enregistrement
-	s.PeerManager.AddOrUpdate(name, addr, pubKey, isRelay)
+	s.Manager.AddOrUpdate(name, addr, pubKey, isRelay)
 
 	if isReply {
 		fmt.Printf("✅ Connecté à %s (%s)\n", name, addr)
@@ -288,7 +193,7 @@ func (s *Server) onDatum(pkt *protocol.Packet) {
 
 	// Stockage
 	s.Downloads.Set(hash, val)
-	
+
 	// Notification aux downloaders en attente
 	s.DatumDispatcher.Dispatch(hash, val)
 }
@@ -302,7 +207,7 @@ func (s *Server) onRootReply(pkt *protocol.Packet, addr *net.UDPAddr) {
 	fmt.Printf("🌳 Réception root hash %x... de %s\n", rootHash, addr)
 
 	// Vérif signature
-	peer, ok := s.PeerManager.GetByAddr(addr)
+	peer, ok := s.Manager.GetByAddr(addr)
 	if !ok {
 		return
 	}
@@ -332,7 +237,7 @@ func (s *Server) onNatRequest(pkt *protocol.Packet, srcAddr *net.UDPAddr) {
 	}
 
 	// On vérifie la signature de Src
-	p, ok := s.PeerManager.GetByAddr(srcAddr)
+	p, ok := s.Manager.GetByAddr(srcAddr)
 	if !ok || !crypto.VerifySignature(p.PublicKey, pkt.DataToSign(), pkt.Signature) {
 		fmt.Printf("❌ NatRequest d'un peer inconnu ou mauvaise signature: %s\n", srcAddr)
 		return
@@ -340,7 +245,7 @@ func (s *Server) onNatRequest(pkt *protocol.Packet, srcAddr *net.UDPAddr) {
 
 	// Vérifier si on connaît la cible (si on est connecté avec elle)
 	targetAddr := targetStruct.ToUDPAddr()
-	targetPeer, targetKnown := s.PeerManager.GetByAddr(targetAddr)
+	targetPeer, targetKnown := s.Manager.GetByAddr(targetAddr)
 
 	if !targetKnown {
 		// La cible n'est pas dans nos pairs connectés, on ne peut pas relayer
@@ -368,7 +273,7 @@ func (s *Server) onNatRequest2(pkt *protocol.Packet, relayAddr *net.UDPAddr) {
 	}
 
 	// Vérification de la signature du relais
-	relay, ok := s.PeerManager.GetByAddr(relayAddr)
+	relay, ok := s.Manager.GetByAddr(relayAddr)
 	if !ok || !crypto.VerifySignature(relay.PublicKey, pkt.DataToSign(), pkt.Signature) {
 		fmt.Printf("❌ NatRequest2 d'un relais inconnu: %s\n", relayAddr)
 		return
@@ -520,10 +425,10 @@ func (s *Server) KeepAlive(serverAddr *net.UDPAddr, interval time.Duration, ctx 
 			return
 		case <-ticker.C:
 			fmt.Println()
-			connectedPeers := s.PeerManager.List()
+			connectedPeers := s.Manager.List()
 			if len(connectedPeers) > 0 {
 				for _, peerName := range connectedPeers {
-					if peerInfo, ok := s.PeerManager.Get(peerName); ok {
+					if peerInfo, ok := s.Manager.Get(peerName); ok {
 						for _, addrInfo := range peerInfo.Addrs {
 							SendPing(s.Conn, addrInfo.Addr)
 							time.Sleep(1 * time.Millisecond)
@@ -531,7 +436,7 @@ func (s *Server) KeepAlive(serverAddr *net.UDPAddr, interval time.Duration, ctx 
 					}
 				}
 			}
-			s.PeerManager.CleanExpired()
+			s.Manager.CleanExpired()
 		}
 	}
 }

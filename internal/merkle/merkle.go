@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sync"
 )
 
 const (
@@ -30,41 +29,6 @@ type DirEntry struct {
 }
 
 // Store : stockage thread-safe des datums
-type Store struct {
-	data map[[32]byte][]byte
-	mu   sync.RWMutex
-}
-
-func NewStore() *Store {
-	return &Store{
-		data: make(map[[32]byte][]byte),
-	}
-}
-
-func (s *Store) Add(datum []byte) [32]byte {
-	hash := sha256.Sum256(datum)
-	s.Set(hash, datum)
-	return hash
-}
-
-func (s *Store) Set(hash [32]byte, datum []byte) {
-	s.mu.Lock()
-	s.data[hash] = datum
-	s.mu.Unlock()
-}
-
-func (s *Store) Get(hash [32]byte) ([]byte, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	data, ok := s.data[hash]
-	return data, ok
-}
-
-func (s *Store) Len() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.data)
-}
 
 // CreateChunk : [Type 0] [Data...]
 func CreateChunk(data []byte) ([]byte, [32]byte) {
@@ -207,41 +171,4 @@ func buildRecursive(store *Store, hashes [][32]byte, nodeType uint8) [32]byte {
 	}
 
 	return buildRecursive(store, parentHashes, nodeType)
-}
-
-func ParseDatum(datum []byte) (uint8, []byte) {
-	if len(datum) == 0 {
-		return 0, nil
-	}
-	return datum[0], datum[1:]
-}
-
-func ParseDirectoryEntries(data []byte) []DirEntry {
-	count := len(data) / DirEntrySize
-	entries := make([]DirEntry, count)
-	for i := range count {
-		start := i * DirEntrySize
-		copy(entries[i].Name[:], data[start:start+FileNameSize])
-		copy(entries[i].Hash[:], data[start+FileNameSize:start+DirEntrySize])
-	}
-	return entries
-}
-
-func ParseBigHashes(data []byte) [][32]byte {
-	count := len(data) / HashSize
-	hashes := make([][32]byte, count)
-	for i := range count {
-		copy(hashes[i][:], data[i*HashSize:(i+1)*HashSize])
-	}
-	return hashes
-}
-
-// Helper retourne le nom d'une entrée (sans les octets nuls)
-func GetEntryName(e DirEntry) string {
-	for i, b := range e.Name[:] {
-		if b == 0 {
-			return string(e.Name[:i])
-		}
-	}
-	return string(e.Name[:])
 }
