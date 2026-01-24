@@ -53,7 +53,7 @@ L'implémentation en Go s'articule autour de : Transport UDP, Merkle (hashing fi
 La clé publique ECDSA est envoyée en PUT au serveur central. Le client établit un socket UDP dual-stack (IPv6 avec fallback IPv4) et effectue un handshake Hello/HelloReply avec le serveur.
 
 \subsection{Keep-Alive}
-Un mécanisme de keep-alive envoie périodiquement des pings (tous les 30s) au serveur central et à tous les pairs connectés pour maintenir les mappings NAT et détecter les pairs inactifs.
+Un mécanisme de keep-alive envoie périodiquement des pings (tous les 3min) au serveur central et à tous les pairs connectés pour maintenir les mappings NAT et détecter les pairs inactifs.
 
 \section{Partage et téléchargement}
 
@@ -61,7 +61,7 @@ Un mécanisme de keep-alive envoie périodiquement des pings (tous les 30s) au s
 Chaque fichier/répertoire est représenté par un arbre de Merkle (SHA-256). Types : Chunk (données brutes, 1024 max), Directory (16 entrées), Big (32 chunks), BigDirectory (32 répertoires).
 
 \subsection{Téléchargement avec fenêtre glissante}
-Le downloader utilise 3 workers : SenderLoop (envoie requêtes), ResponseLoop (traite réponses), MonitorLoop (gère timeouts). La fenêtre s'ajuste dynamiquement (1-100 paquets) en fonction des performances réseau.
+Le downloader utilise 3 workers : SenderLoop (envoie requêtes), ResponseLoop (traite réponses), MonitorLoop (gère timeouts). La fenêtre s'ajuste dynamiquement en fonction des performances réseau.
 
 \section{Fonctionnalités avancées}
 
@@ -70,7 +70,7 @@ Les clients derrière NAT peuvent communiquer via un relais (pair avec extension
 \begin{enumerate}
     \item Source demande au relais
     \item Relais notifie la cible
-    \item Les deux exécutent du hole punching simultané avec backoff exponentiel (1s, 2s, 4s)
+    \item Les deux exécutent du hole punching simultané avec backoff exponentiel (0s, 1s, 2s)
     \item NAT crée des mappings permettant la connexion directe
 \end{enumerate}
 

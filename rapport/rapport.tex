@@ -34,61 +34,61 @@
 
 \chapter{Introduction}
 
-Ce projet implémente un système de partage de fichiers pair-à-pair (P2P) utilisant un serveur central pour la découverte des pairs et l'échange de clés publiques. Le système utilise le protocole UDP pour toutes les communications et implémente un arbre de Merkle pour garantir l'intégrité des données échangées.
+Ce projet crée un système de partage de fichiers peer-to-peer (P2P) avec un serveur central. Le serveur gère la découverte des pairs et l'échange des clés. Tout communique en UDP et on utilise un arbre de Merkle pour vérifier que les données ne sont pas corrompues.
 
 \section{Objectifs du projet}
 
-L'objectif principal est de créer un client capable de :
+Le client doit pouvoir :
 \begin{itemize}
-    \item S'enregistrer auprès d'un serveur central et maintenir cette connexion indéfiniment
-    \item Partager des fichiers et répertoires avec d'autres pairs
-    \item Télécharger des fichiers depuis d'autres pairs
-    \item Fonctionner derrière un NAT grâce à des mécanismes de traversal
-    \item Gérer efficacement les transferts avec fenêtre glissante et contrôle de congestion
+    \item S'inscrire auprès du serveur et rester connecté
+    \item Partager ses fichiers avec les autres
+    \item Télécharger des fichiers depuis d'autres utilisateurs
+    \item Fonctionner même derrière un NAT
+    \item Gérer les téléchargements efficacement avec une fenêtre glissante
 \end{itemize}
 
 \section{Architecture générale}
 
-L'implémentation est réalisée en Go et s'articule autour de plusieurs composants clés :
+On l'a écrit en Go avec plusieurs parties :
 \begin{itemize}
-    \item \textbf{Module transport} : Gestion des communications UDP, connexion au serveur, échange de paquets
-    \item \textbf{Module merkle} : Construction et validation des arbres de Merkle pour les fichiers et répertoires
-    \item \textbf{Module crypto} : Génération et gestion des clés ECDSA, signatures numériques
-    \item \textbf{Module peer} : Gestion de la liste des pairs connectés et de leurs adresses
-    \item \textbf{Module protocol} : Définition des types de messages et encodage/décodage des paquets
+    \item \textbf{Transport} : Gère la communication en UDP
+    \item \textbf{Merkle} : Crée les arbres Merkle pour les fichiers
+    \item \textbf{Crypto} : Gère les clés et les signatures
+    \item \textbf{Peer} : Tient à jour la liste des autres utilisateurs
+    \item \textbf{Protocol} : Définit les types de messages
 \end{itemize}
 
 \chapter{Implementation minimum}
 \section{Enregistrement serveur central}
 
 \subsection{Enregistrement de la clé publique}
-Pour le processus d'enregistrement au serveur central, nous avons d'abord l'enregistrement de la clé publique. Nous avons encodé notre clé privée en clé publique, puis nous avons envoyé une requête PUT au serveur central avec la clé publique dans le corps de la requête. Le serveur central stocke cette clé pour permettre aux autres clients de la récupérer ultérieurement.
+D'abord, on envoie notre clé publique au serveur central. Le serveur la stocke pour que les autres puissent la récupérer et vérifier nos signatures.
 
 \subsection{Enregistrement de l'adresse IP et du port}
 
-L'enregistrement de l'adresse IP et du port UDP auprès du serveur central en Dual-Stack est géré par la fonction \texttt{TryConnectWithFallback}. Cette fonction tente d'abord d'ouvrir un socket UDP en mode Dual-Stack (IPv6 avec support IPv4). Si cette tentative échoue, elle bascule automatiquement en mode IPv4 pur.
+Pour enregistrer notre adresse IP, on utilise \texttt{TryConnectWithFallback}. On essaie d'abord de se connecter en IPv6, et si ça ne marche pas, on bascule sur IPv4.
 
-\subsubsection{Dual-Stack avec Fallback}
+\subsubsection{Connexion IPv4/IPv6}
 
-Notre fonction \texttt{TryConnectWithFallback} implémente une méthode de connexion robuste en deux étapes :
+La fonction \texttt{TryConnectWithFallback} fonctionne en deux étapes :
 
-\paragraph{Étape 1 : Ouverture du socket local}
-Le client tente d'abord d'ouvrir un socket en mode Dual-Stack (IPv6 avec support IPv4) :
+\paragraph{Étape 1 : Ouvrir la connexion}
+On essaie d'abord d'ouvrir un socket IPv6 :
 \begin{lstlisting}[language=Go]
 addrV6, _ := net.ResolveUDPAddr("udp", "[::]:0")
 conn, err = net.ListenUDP("udp", addrV6)
 \end{lstlisting}
 
-Si cette tentative échoue (notamment sur certaines configurations Windows ou WSL), le système bascule automatiquement en mode IPv4 pur :
+Si ça ne marche pas, on bascule sur IPv4 :
 \begin{lstlisting}[language=Go]
 addrV4, _ := net.ResolveUDPAddr("udp4", "0.0.0.0:0")
 conn, err = net.ListenUDP("udp4", addrV4)
 \end{lstlisting}
 
-Le port local est laissé à 0 pour que le système d'exploitation choisisse un port disponible, évitant ainsi les conflits "Address already in use".
+On met le port à 0 pour que le système choisisse un port libre automatiquement.
 
-\paragraph{Étape 2 : Handshake avec le serveur}
-Une fois le socket local ouvert, le client détermine quelle adresse du serveur utiliser. En mode Dual-Stack, le client privilégie d'abord l'IPv6, puis tente l'IPv4 en fallback :
+\paragraph{Étape 2 : Se connecter au serveur}
+Après, on détermine quelle adresse du serveur utiliser. On préfère IPv6, sinon on essaie IPv4 :
 
 \begin{lstlisting}[language=Go]
 if isDualStack {
@@ -97,31 +97,31 @@ if isDualStack {
 targets = append(targets, protocol.GetServerUDPv4())
 \end{lstlisting}
 
-Pour chaque adresse cible, le client :
+Pour chaque adresse du serveur, on :
 \begin{enumerate}
-    \item Envoie un message \texttt{Hello} contenant son nom et signé avec sa clé privée
-    \item Attend une réponse du serveur pendant 2 secondes maximum
-    \item Vérifie que la réponse correspond bien à sa requête via l'ID du message
+    \item Envoie un \texttt{Hello} signé avec notre clé privée
+    \item On attend une réponse (max 2 secondes)
+    \item On vérifie que c'est bien la bonne réponse en regardant l'ID
 \end{enumerate}
 
-\subsubsection{Gestion de la réponse serveur}
+\subsubsection{Attendre la réponse}
 
-La fonction \texttt{waitResponse} implémente un mécanisme de timeout robuste :
+\texttt{waitResponse} attend la réponse du serveur :
 
 \begin{lstlisting}[language=Go]
 deadline := time.Now().Add(2 * time.Second)
 conn.SetReadDeadline(deadline)
 \end{lstlisting}
 
-Elle lit les paquets entrants en boucle et vérifie que :
+Elle vérifie que :
 \begin{itemize}
-    \item L'ID du paquet correspond à celui envoyé (pour éviter les confusions)
-    \item Le type de message est valide (\texttt{HelloReply}, \texttt{Ok}, ou \texttt{Ping})
+    \item L'ID correspond à celui qu'on a envoyé
+    \item Le type de message est correct
 \end{itemize}
 
-\subsubsection{Optimisation Dual-Stack}
+\subsubsection{Double connexion}
 
-Lorsque la connexion est établie en mode Dual-Stack via IPv6, le client envoie également un ping sur l'adresse IPv4 du serveur :
+Quand on est connecté en IPv6, on envoie aussi un ping sur IPv4 :
 
 \begin{lstlisting}[language=Go]
 if isDualStack && targetStr == protocol.GetServerUDPv6() {
@@ -132,15 +132,15 @@ if isDualStack && targetStr == protocol.GetServerUDPv6() {
 }
 \end{lstlisting}
 
-Cette technique permet au serveur d'enregistrer les deux adresses du client (IPv4 et IPv6), garantissant ainsi une connectivité maximale avec les autres peers.
+Ça permet au serveur de nous enregistrer sur les deux protocoles.
 
 \subsection{Maintien de la connexion}
 
-Une fois la connexion établie avec le serveur central et les autres pairs, il est essentiel de maintenir ces connexions actives pour éviter les timeouts et les déconnexions silencieuses. Notre implémentation utilise un mécanisme de keep-alive basé sur des pings périodiques.
+Une fois connecté, on doit rester en contact avec le serveur et les autres utilisateurs. On utilise des pings réguliers pour ça.
 
-\subsubsection{Mécanisme de Keep-Alive}
+\subsubsection{Mécanisme de keep-alive}
 
-La fonction \texttt{KeepAlive} s'exécute en arrière-plan dans une goroutine dédiée et envoie régulièrement des pings à tous les pairs connectés. Elle utilise un ticker pour déclencher ces pings à intervalle régulier (typiquement 30 secondes) :
+La fonction \texttt{KeepAlive} s'exécute en arrière-plan et envoie régulièrement des pings. Elle utilise un ticker pour déclencher les pings :
 
 \begin{lstlisting}[language=Go]
 func (s *Server) KeepAlive(serverAddr *net.UDPAddr, 
@@ -161,92 +161,59 @@ func (s *Server) KeepAlive(serverAddr *net.UDPAddr,
 }
 \end{lstlisting}
 
-\subsubsection{Stratégie de Ping Multi-Cibles}
+\subsubsection{Stratégie de ping}
 
-À chaque cycle de keep-alive, le client effectue trois types de pings distincts :
-
-\paragraph{1. Ping du serveur central}
-Le client ping d'abord le serveur central sur ses deux adresses (IPv6 et IPv4 si disponibles). Les adresses sont ré-résolues à chaque fois pour gérer les potentiels changements d'IP DNS :
+À chaque cycle, on ping tous les autres utilisateurs connectés. Pour chaque utilisateur, on envoie un ping sur toutes ses adresses :
 
 \begin{lstlisting}[language=Go]
-// Ping IPv6
-if addr, err := net.ResolveUDPAddr("udp", 
-               protocol.GetServerUDPv6()); err == nil {
-    SendPing(s.Conn, addr)
-    time.Sleep(1 * time.Microsecond) // Garantir un ID unique
-}
-
-// Ping IPv4
-if addr, err := net.ResolveUDPAddr("udp", 
-               protocol.GetServerUDPv4()); err == nil {
-    SendPing(s.Conn, addr)
-    time.Sleep(1 * time.Microsecond)
-}
-\end{lstlisting}
-
-Le délai d'une microseconde entre chaque ping garantit que chaque message aura un ID unique basé sur le timestamp.
-
-\paragraph{2. Ping des pairs connectés}
-Ensuite, le client ping tous les pairs du réseau P2P avec lesquels il a établi une connexion. Pour chaque pair, toutes ses adresses connues (IPv4 et IPv6) sont pingées :
-
-\begin{lstlisting}[language=Go]
-connectedPeers := s.PeerManager.List()
-for _, peerName := range connectedPeers {
-    if peerInfo, ok := s.PeerManager.Get(peerName); ok 
-       && peerInfo.Name != "jch.irif.fr" {
-        for _, addr := range peerInfo.Addrs {
-            SendPing(s.Conn, addr)
-            time.Sleep(1 * time.Microsecond)
+connectedPeers := s.Manager.List()
+if len(connectedPeers) > 0 {
+    for _, peerName := range connectedPeers {
+        if peerInfo, ok := s.Manager.Get(peerName); ok {
+            for _, addrInfo := range peerInfo.Addrs {
+                SendPing(s.Conn, addrInfo.Addr)
+                time.Sleep(1 * time.Millisecond)
+            }
         }
     }
 }
 \end{lstlisting}
 
-Cette approche garantit que :
-\begin{itemize}
-    \item Les pairs restent conscients de notre présence active
-    \item Les NAT/firewalls maintiennent les mappings de port ouverts
-    \item Les changements d'adresse sont détectés rapidement
-\end{itemize}
+On attend 1 milliseconde entre chaque ping pour éviter de surcharger le réseau.
 
-\paragraph{3. Nettoyage des pairs expirés}
-Après l'envoi des pings, le client nettoie sa liste de pairs pour supprimer ceux qui n'ont pas répondu depuis un certain temps :
+Après avoir envoyé tous les pings, on nettoie la liste :
 
 \begin{lstlisting}[language=Go]
-s.PeerManager.CleanExpired()
+s.Manager.CleanExpired()
 \end{lstlisting}
 
-Cette opération évite l'accumulation de pairs morts dans la liste et libère les ressources associées.
+Ça supprime les utilisateurs qui n'ont pas répondu depuis longtemps. Cette approche garantit que :
+\begin{itemize}
+    \item Les autres savent qu'on est actif
+    \item Les vieux utilisateurs sont enlevés de la liste
+    \item Les NAT gardent les ports ouverts
+\end{itemize}
 
-\subsubsection{Gestion des réponses Ping}
+\subsubsection{Traiter les pings reçus}
 
-Lorsqu'un pair reçoit un message \texttt{Ping}, il répond immédiatement avec un message \texttt{Ok} portant le même ID :
+Quand on reçoit un ping d'un autre utilisateur, on répond immédiatement :
 
 \begin{lstlisting}[language=Go]
 case protocol.Ping:
     SendOk(s.Conn, addr, pkt.Header.ID)
 \end{lstlisting}
 
-La réception de tout message (pas seulement \texttt{Ok}) d'un pair met à jour son timestamp d'activité :
-
-\begin{lstlisting}[language=Go]
-if p, ok := s.PeerManager.GetByAddr(addr); ok {
-    s.PeerManager.AddOrUpdate(p.Name, addr, 
-                              p.PublicKey, p.IsRelay)
-}
-\end{lstlisting}
-
-Cette approche permet de considérer toute activité réseau comme preuve de vie, pas seulement les réponses aux pings explicites.
+À chaque message reçu (pas juste les pings), on met à jour le timestamp de l'utilisateur pour savoir qu'il est actif. Ça permet de détecter rapidement si quelqu'un n'est plus en ligne.
 
 \section{Partage de fichiers et répertoires}
 
 \subsection{Structure de l'arbre de Merkle}
 
-Notre implémentation utilise un arbre de Merkle pour représenter les fichiers et répertoires partagés. Chaque nœud de l'arbre est identifié par le hash SHA-256 de son contenu, garantissant l'intégrité des données.
+On utilise un arbre de Merkle pour représenter les fichiers et répertoires. Chaque nœud a un hash SHA-256 unique, ce qui garantit que les données ne sont pas corrompues. Au démarrage, les fichiers locaux sont convertis en arbres Merkle.
 
 \subsubsection{Types de nœuds}
 
-Le protocole définit quatre types de nœuds :
+Il y a quatre types de nœuds :
 
 \begin{itemize}
     \item \textbf{Type 0 (Chunk)} : Données brutes d'un fichier (max 1024 octets)
@@ -255,366 +222,206 @@ Le protocole définit quatre types de nœuds :
     \item \textbf{Type 3 (BigDirectory)} : Répertoire fragmenté (max 32 sous-répertoires)
 \end{itemize}
 
-\subsubsection{Construction d'un chunk}
+\subsubsection{Stockage des fichiers}
 
-Un chunk de type 0 est construit en préfixant les données avec le type :
-
-\begin{lstlisting}[language=Go]
-func CreateChunk(data []byte) ([]byte, [32]byte) {
-    if len(data) > MaxChunkSize {
-        panic("Taille du chunk trop grande")
-    }
-    datum := make([]byte, 1+len(data))
-    datum[0] = TypeChunk
-    copy(datum[1:], data)
-    return datum, sha256.Sum256(datum)
-}
-\end{lstlisting}
-
-\subsubsection{Construction d'un répertoire simple}
-
-Un répertoire de type 1 contient jusqu'à 16 entrées, chacune composée d'un nom (32 octets) et d'un hash (32 octets) :
+Le module \texttt{merkle} gère le stockage des données avec une structure thread-safe :
 
 \begin{lstlisting}[language=Go]
-func CreateDirectoryNode(entries []DirEntry) ([]byte, [32]byte) {
-    if len(entries) > MaxDirEntries {
-        panic("Trop d'entrees dans le repertoire")
-    }
-    datum := make([]byte, 1+len(entries)*DirEntrySize)
-    datum[0] = TypeDirectory
-    for i, e := range entries {
-        offset := 1 + i*DirEntrySize
-        copy(datum[offset:], e.Name[:])
-        copy(datum[offset+FileNameSize:], e.Hash[:])
-    }
-    return datum, sha256.Sum256(datum)
+type Store struct {
+    data map[[32]byte][]byte
+    mu   sync.RWMutex
 }
+
+func (s *Store) Add(datum []byte) [32]byte { ... }
+func (s *Store) Get(hash [32]byte) ([]byte, bool) { ... }
 \end{lstlisting}
 
-Cette structure permet de partager des répertoires de moins de 16 entrées conformément aux exigences minimales.
-
-\subsection{Réponse aux requêtes}
-
-Lorsqu'un pair demande un datum (fichier ou répertoire), le serveur vérifie d'abord dans ses stores locaux :
-
-\begin{lstlisting}[language=Go]
-func (s *Server) onDatumRequest(pkt *protocol.Packet, addr *net.UDPAddr) {
-    hash, err := protocol.DecodeHashBody(pkt.Body)
-    if err != nil {
-        return
-    }
-    
-    // Chercher d'abord en local, puis dans le cache telecharge
-    data, ok := s.MerkleStore.Get(hash)
-    if !ok {
-        data, ok = s.Downloads.Get(hash)
-    }
-    
-    if ok {
-        SendDatum(s.Conn, addr, hash, data, pkt.Header.ID)
-    } else {
-        SendNoDatum(s.Conn, addr, hash, s.PrivKey, pkt.Header.ID)
-    }
-}
-\end{lstlisting}
-
-Le système maintient deux stores distincts :
+On a deux stores :
 \begin{itemize}
-    \item \texttt{MerkleStore} : Fichiers partagés localement
-    \item \texttt{Downloads} : Fichiers téléchargés depuis d'autres pairs
+    \item \texttt{MerkleStore} : Fichiers qu'on partage
+    \item \texttt{Downloads} : Fichiers qu'on a téléchargés depuis les autres
 \end{itemize}
+
+
 
 \section{Téléchargement de fichiers}
 
-\subsection{Architecture du downloader}
+\subsection{Architecture générale}
 
-Le téléchargement est géré par le module \texttt{Downloader}, qui implémente une fenêtre glissante avec contrôle de congestion adaptatif. L'architecture repose sur trois workers concurrents :
+Le téléchargement est géré par deux composants :
+
+\begin{itemize}
+    \item \textbf{Downloader} : Télécharge en mémoire pour explorer les fichiers
+    \item \textbf{DiskDownloader} : Télécharge et sauvegarde sur le disque
+\end{itemize}
+
+Un dispatcher centralisé gère les paquets reçus et peut notifier plusieurs downloader en même temps.
+
+\subsection{Fenêtre glissante adaptative}
+
+La fenêtre glissante contrôle le nombre de requêtes qu'on envoie en même temps. Elle s'ajuste selon la vitesse du réseau :
+
+\begin{lstlisting}[language=Go]
+type Downloader struct {
+    windowSize    int
+    maxWindowSize int
+    minWindowSize int
+    timeout       time.Duration
+    
+    pending map[[32]byte]time.Time
+    retries map[[32]byte]int
+}
+\end{lstlisting}
+
+Le downloader a trois workers qui tournent en parallèle :
 
 \begin{enumerate}
-    \item \textbf{SenderLoop} : Envoie les requêtes de datums en respectant la taille de fenêtre
-    \item \textbf{ResponseLoop} : Traite les réponses reçues et ajuste la fenêtre
-    \item \textbf{MonitorLoop} : Gère les timeouts et retransmissions
+    \item \textbf{senderLoop} : Envoie les demandes en respectant la taille de la fenêtre
+    \item \textbf{responseLoop} : Traite les réponses et ajuste la fenêtre
+    \item \textbf{monitorLoop} : Vérifie les timeouts et renvoie ce qui n'a pas répondu
 \end{enumerate}
-
-\subsection{Fenêtre glissante}
-
-La fenêtre glissante limite le nombre de requêtes en vol simultanées, évitant ainsi la congestion du réseau :
-
-\begin{lstlisting}[language=Go]
-// Worker 1 : Envoie les demandes
-func (d *Downloader) senderLoop() {
-    for d.running {
-        // 1. Check Window
-        d.mu.Lock()
-        canSend := len(d.pending) < d.windowSize
-        d.mu.Unlock()
-        
-        if !canSend {
-            time.Sleep(10 * time.Millisecond)
-            continue
-        }
-        
-        // 2. Get Job
-        hash, ok := <-d.workCh
-        if !ok {
-            return
-        }
-        
-        // 3. Check si on l'a deja
-        if _, exists := d.server.Downloads.Get(hash); exists {
-            continue
-        }
-        
-        // 4. Check si deja en cours
-        d.mu.Lock()
-        if _, inflight := d.pending[hash]; inflight {
-            d.mu.Unlock()
-            continue
-        }
-        d.pending[hash] = time.Now()
-        d.mu.Unlock()
-        
-        // 5. Send
-        SendDatumRequest(d.server.Conn, d.peerAddr, hash)
-    }
-}
-\end{lstlisting}
-
-\subsection{Contrôle de congestion adaptatif}
-
-La taille de la fenêtre s'ajuste dynamiquement selon les performances du réseau :
-
-\begin{lstlisting}[language=Go]
-func (d *Downloader) responseLoop() {
-    for hash := range d.responseCh {
-        d.mu.Lock()
-        sentAt, ok := d.pending[hash]
-        if ok {
-            // Succes !
-            d.successCount++
-            d.failureCount = 0
-            
-            // Augmenter la fenetre si reponse rapide
-            if time.Since(sentAt) < d.timeout/2 
-               && d.windowSize < d.maxWindowSize {
-                d.windowSize++
-            }
-            delete(d.pending, hash)
-            delete(d.retries, hash)
-        }
-        d.mu.Unlock()
-        
-        // Traiter les enfants (recursion)
-        if datum, ok := d.server.Downloads.Get(hash); ok {
-            d.processChildren(datum)
-        }
-    }
-}
-\end{lstlisting}
-
-Ce mécanisme offre plusieurs avantages :
-\begin{itemize}
-    \item \textbf{Adaptation automatique} : La fenêtre augmente si le réseau est performant
-    \item \textbf{Réduction lors d'échecs} : La fenêtre diminue en cas de timeouts
-    \item \textbf{Limites configurables} : Fenêtre entre 1 et 100 paquets
-\end{itemize}
 
 \subsection{Gestion des timeouts et retransmissions}
 
-Un worker de monitoring vérifie périodiquement les requêtes en attente et retransmet celles qui ont expiré :
+Le \texttt{monitorLoop} vérifie les demandes qui n'ont pas eu de réponse :
 
-\begin{lstlisting}[language=Go]
-// Verifier les timeouts
-d.mu.Lock()
-for hash, sentAt := range d.pending {
-    if time.Since(sentAt) > d.timeout {
-        // Timeout detecte
-        retryCount := d.retries[hash]
-        if retryCount >= MaxRetries {
-            // Abandonner
-            delete(d.pending, hash)
-            delete(d.retries, hash)
-            d.failureCount++
-            d.windowSize = max(d.minWindowSize, d.windowSize-1)
-        } else {
-            // Retransmission
-            d.retries[hash]++
-            d.pending[hash] = time.Now()
-            SendDatumRequest(d.server.Conn, d.peerAddr, hash)
-        }
-    }
-}
-d.mu.Unlock()
-\end{lstlisting}
+\begin{itemize}
+    \item Timeout : On renvoie la demande jusqu'à un max de tentatives
+    \item Ça échoue trop : On réduit la fenêtre
+    \item Abandon : On supprime si ça marche pas
+\end{itemize}
+
+La fenêtre s'ajuste :
+\begin{itemize}
+    \item Si c'est rapide : On l'augmente
+    \item Si c'est lent : On la réduit
+    \item Limites : Entre le min et le max configurés
+\end{itemize}
 
 \subsection{Téléchargement récursif}
 
-Le système télécharge récursivement tous les nœuds de l'arbre de Merkle :
+On télécharge tout l'arbre Merkle en descendant récursivement :
 
 \begin{enumerate}
-    \item Demande du hash racine au pair
-    \item Réception du datum racine
-    \item Analyse du type de nœud et extraction des hashes enfants
-    \item Ajout des hashes enfants à la file de téléchargement
-    \item Répétition jusqu'à avoir téléchargé tous les nœuds
+    \item Demander le hash racine
+    \item Recevoir le fichier racine
+    \item Voir quel type c'est et extraire les hashes enfants
+    \item Ajouter les enfants à la file d'attente
+    \item Recommencer jusqu'à avoir tout
 \end{enumerate}
 
-Cette approche permet de télécharger des fichiers individuels ou des arborescences complètes selon les besoins de l'utilisateur.
+Ça permet de télécharger juste des fichiers ou des arborescences complètes selon ce qu'on veut.
 
 \chapter{Fonctionnalités avancées}
 
-\section{Traversal NAT}
+\section{Interface utilisateur interactive}
 
-L'une des fonctionnalités avancées implémentées est le NAT traversal, permettant à deux clients derrière des NAT différents de communiquer directement via un pair relais.
+L'appli propose un menu interactif pour :
 
-\subsection{Principe du NAT traversal}
-
-Le mécanisme repose sur trois acteurs :
 \begin{itemize}
-    \item \textbf{Source} : Le client qui souhaite établir une connexion
-    \item \textbf{Cible} : Le client à atteindre derrière un NAT
-    \item \textbf{Relais} : Un pair avec l'extension \texttt{NatTraversalRelay} qui coordonne la connexion
+    \item Voir les autres utilisateurs du réseau
+    \item Se connecter à un utilisateur
+    \item Explorer les fichiers d'un autre
+    \item Télécharger des fichiers manuellement
+    \item Voir les connexions actives
+    \item Voir ses propres fichiers
+    \item Activer le mode debug pour voir les paquets
 \end{itemize}
 
-\subsection{Protocole de traversal}
-
-Le protocole se déroule en plusieurs étapes :
-
-\paragraph{1. Requête au relais}
-La source envoie un message \texttt{NatTraversalRequest} au relais, contenant l'adresse de la cible :
-
-\begin{lstlisting}[language=Go]
-func (s *Server) onNatRequest(pkt *protocol.Packet, srcAddr *net.UDPAddr) {
-    targetStruct, err := protocol.DecodeSocketAddress(pkt.Body)
-    if err != nil {
-        return
-    }
-    
-    // Verifier la signature de la source
-    p, ok := s.PeerManager.GetByAddr(srcAddr)
-    if !ok || !crypto.VerifySignature(p.PublicKey, 
-                   pkt.DataToSign(), pkt.Signature) {
-        return
-    }
-    
-    // Verifier si la cible est connue
-    targetAddr := targetStruct.ToUDPAddr()
-    targetPeer, targetKnown := s.PeerManager.GetByAddr(targetAddr)
-    
-    if !targetKnown {
-        SendError(s.Conn, srcAddr, "Cible non connectee", pkt.Header.ID)
-        return
-    }
-    
-    // OK a la source
-    SendOk(s.Conn, srcAddr, pkt.Header.ID)
-    
-    // Notifier la cible
-    SendNatTraversalRequest2(s.Conn, targetAddr, srcAddr, s.PrivKey)
-}
-\end{lstlisting}
-
-\paragraph{2. Notification à la cible}
-Le relais envoie un \texttt{NatTraversalRequest2} à la cible, lui indiquant l'adresse de la source.
-
-\paragraph{3. Hole punching}
-La cible reçoit la notification et commence à envoyer des pings vers la source avec un backoff exponentiel :
-
-\begin{lstlisting}[language=Go]
-func (s *Server) onNatRequest2(pkt *protocol.Packet, relayAddr *net.UDPAddr) {
-    srcStruct, err := protocol.DecodeSocketAddress(pkt.Body)
-    srcAddr := srcStruct.ToUDPAddr()
-    
-    // Creer un canal pour detecter les receptions
-    responseChan := make(chan *net.UDPAddr, 10)
-    s.PingResponseChan = responseChan
-    
-    // Backoff exponentiel : 3 tentatives
-    count := 3
-    totalTimeout := CalExpo2Time(count)
-    
-    for i := range count {
-        SendPing(s.Conn, srcAddr)
-        
-        // Attendre avec backoff (1s, 2s, 4s)
-        if i < count-1 {
-            waitTime := time.Duration(1<<uint(i)) * time.Second
-            select {
-            case <-stopSending:
-                return // Succes
-            case <-time.After(waitTime):
-                // Continuer
-            }
-        }
-    }
-}
-\end{lstlisting}
-
-\paragraph{4. Établissement de la connexion}
-Pendant ce temps, la source envoie également des pings vers la cible. Grâce au hole punching, les NAT créent des mappings temporaires permettant aux paquets de passer dans les deux sens.
-
-\subsection{Détection du succès}
-
-Chaque paquet reçu déclenche une notification sur le canal \texttt{PingResponseChan} :
-
-\begin{lstlisting}[language=Go]
-// Dans handlePacket
-s.PingResponseMu.Lock()
-if s.PingResponseChan != nil {
-    select {
-    case s.PingResponseChan <- addr:
-    default:
-    }
-}
-s.PingResponseMu.Unlock()
-\end{lstlisting}
-
-Dès qu'un paquet est reçu de l'adresse cible, le processus s'arrête avec succès.
-
-\subsection{Gestion des relais}
-
-Les pairs qui souhaitent servir de relais s'annoncent avec l'extension \texttt{NatTraversalRelay} dans leur message Hello :
-
-\begin{lstlisting}[language=Go]
-isRelay := (extensions & protocol.ExtNatTraversalRelay) != 0
-s.PeerManager.AddOrUpdate(name, addr, pubKey, isRelay)
-\end{lstlisting}
-
-Le \texttt{PeerManager} maintient cette information et peut fournir la liste des relais disponibles.
-
-\section{Interface utilisateur}
-
-L'application propose une interface en ligne de commande interactive permettant :
+Le module \texttt{menu} implémente ce menu avec :
 
 \begin{itemize}
-    \item La sélection du répertoire à partager
-    \item La liste des pairs connectés avec leurs adresses IPv4/IPv6
-    \item Le téléchargement interactif de fichiers depuis un pair
-    \item L'affichage de l'arborescence des fichiers distants
-    \item Le téléchargement sélectif de fichiers ou de répertoires entiers
-    \item L'affichage des statistiques de transfert (vitesse, progression)
+    \item \textbf{Run} : La boucle principale du menu
+    \item \textbf{listDirectoryPeers} : Affiche la liste des autres utilisateurs
+    \item \textbf{connectToPeer} : Se connecte à quelqu'un
+    \item \textbf{explorePeer} : Parcourt les fichiers d'un autre utilisateur
+    \item \textbf{downloadManual} : Télécharge un fichier par son hash
+    \item \textbf{showConnections} : Affiche qui est connecté
+    \item \textbf{showLocalFiles} : Affiche ses propres fichiers
 \end{itemize}
 
 \section{Gestion multi-protocoles IPv4/IPv6}
 
-Notre implémentation gère nativement les deux protocoles :
+On supporte les deux protocoles avec du fallback automatique.
 
-\begin{itemize}
-    \item \textbf{Dual-Stack} : Écoute simultanée sur IPv4 et IPv6
-    \item \textbf{Enregistrement multiple} : Chaque client enregistre ses deux adresses
-    \item \textbf{Ping multi-adresses} : Les keep-alive maintiennent tous les chemins réseau
-    \item \textbf{Fallback automatique} : Basculement transparent si un protocole échoue
-\end{itemize}
+\subsection{Dual-Stack avec fallback automatique}
 
-Le \texttt{PeerManager} stocke toutes les adresses de chaque pair :
+\texttt{TryConnectWithFallback} se connecte en IPv6 d'abord, puis bascule sur IPv4.
+
+\subsubsection{Ouverture du socket local}
+
+On essaie d'ouvrir un socket IPv6 :
+
+\begin{lstlisting}[language=Go]
+addrV6, _ := net.ResolveUDPAddr("udp", "[::]:0")
+conn, err = net.ListenUDP("udp", addrV6)
+
+if err == nil {
+    isDualStack = true
+} else {
+    // Fallback IPv4
+    addrV4, _ := net.ResolveUDPAddr("udp4", "0.0.0.0:0")
+    conn, err = net.ListenUDP("udp4", addrV4)
+}
+\end{lstlisting}
+
+Le port local est laissé à 0 pour que le système d'exploitation choisisse un port disponible, évitant ainsi les conflits « Address already in use ».
+
+\subsubsection{Se connecter au serveur}
+
+Après avoir ouvert le socket, on détermine quelle adresse du serveur utiliser :
+
+\begin{lstlisting}[language=Go]
+if isDualStack {
+    targets = append(targets, protocol.GetServerUDPv6())
+}
+targets = append(targets, protocol.GetServerUDPv4())
+\end{lstlisting}
+
+Pour chaque adresse cible, on :
+\begin{enumerate}
+    \item Envoie un \texttt{Hello} signé avec notre clé
+    \item On attend une réponse (max 2 secondes)
+    \item On vérifie que c'est la bonne réponse
+\end{enumerate}
+
+\subsection{Double enregistrement Dual-Stack}
+
+Quand on est connecté en IPv6, on envoie aussi un ping sur IPv4 pour que le serveur nous enregistre sur les deux :
+
+\begin{lstlisting}[language=Go]
+if isDualStack && targetStr == protocol.GetServerUDPv6() {
+    if otherAddr, err := net.ResolveUDPAddr("udp", 
+                         protocol.GetServerUDPv4()); err == nil {
+        SendHello(conn, otherAddr, name, privKey)
+    }
+}
+\end{lstlisting}
+
+\subsection{Gestion des adresses multiples par pair}
+
+On stocke toutes les adresses (IPv4 et IPv6) de chaque utilisateur :
 
 \begin{lstlisting}[language=Go]
 type PeerInfo struct {
     Name      string
-    Addrs     []*net.UDPAddr // Support IPv4 et IPv6
+    Addrs     []AddrInfo
     PublicKey *ecdsa.PublicKey
     LastSeen  time.Time
     IsRelay   bool
 }
+
+type AddrInfo struct {
+    Addr     *net.UDPAddr
+    LastSeen time.Time
+}
 \end{lstlisting}
+
+Quand on reçoit une adresse d'un utilisateur, on :
+
+\begin{itemize}
+    \item IPv4 connu → On remplace l'ancienne adresse IPv4
+    \item IPv6 connu → On remplace l'ancienne adresse IPv6
+    \item Nouveau protocole → On l'ajoute
+\end{itemize}
 \end{document}
