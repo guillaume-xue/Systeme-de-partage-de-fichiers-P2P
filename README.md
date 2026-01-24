@@ -28,6 +28,11 @@ Le binaire `client` sera créé dans le répertoire courant.
 
 Une fois le menu affiché, appuyez sur `7` pour activer le mode debug.
 
+## OU
+```bash
+  make
+```
+
 ## Utilisation du menu
 
 Après le démarrage, un menu interactif s'affiche :
