@@ -118,14 +118,28 @@ func (d *Downloader) DownloadTree(rootHash [32]byte) {
 	fmt.Println("\n✅ Exploration terminée.")
 }
 
-// Callback du dispatcher
+// Callback du dispatcher — retrait immédiat de pending pour éviter les faux timeouts
 func (d *Downloader) onDatumReceived(hash [32]byte, _ []byte) {
-	// On envoie juste le signal, le worker traitera
-	select {
-	case d.responseCh <- hash:
-	default:
-		// Si channel plein, c'est pas grave, le timeout gérera ou le prochain paquet
+	// Retirer de pending DÈS la réception UDP (pas dans responseLoop)
+	// Sinon sur un PC lent, le traitement des enfants bloque responseLoop
+	// et le monitor croit que ces paquets n'ont pas été reçus → faux timeout
+	d.mu.Lock()
+	sentAt, ok := d.pending[hash]
+	wasRetried := d.retries[hash] > 0 // Karn
+	if ok {
+		responseTime := time.Since(sentAt)
+		if !wasRetried {
+			d.updateRTTAndWindow(responseTime)
+		} else {
+			d.growWindowOnly(responseTime)
+		}
+		d.removeFromPendingDownloader(hash)
 	}
+	d.mu.Unlock()
+
+	// Signal garanti : goroutine pour ne pas bloquer le callback UDP
+	// et ne jamais perdre de signal (sinon enfants jamais explorés)
+	go func() { d.responseCh <- hash }()
 }
 
 // Worker 1 : Envoie les demandes
@@ -172,33 +186,16 @@ func (d *Downloader) senderLoop() {
 	}
 }
 
-// Worker 2 : Traite les réceptions
+// Worker 2 : Traite les réceptions (exploration des enfants uniquement)
 func (d *Downloader) responseLoop() {
 	defer d.wg.Done()
 
 	for hash := range d.responseCh {
-		d.mu.Lock()
-		sentAt, ok := d.pending[hash]
-		wasRetried := d.retries[hash] > 0 // Algorithme de Karn
-		if ok {
-			responseTime := time.Since(sentAt)
-			// Karn : pas de mise à jour RTT sur retransmission
-			if !wasRetried {
-				d.updateRTTAndWindow(responseTime)
-			} else {
-				d.growWindowOnly(responseTime)
-			}
-			d.removeFromPendingDownloader(hash)
-		}
-		d.mu.Unlock()
-
-		// Incrémenter les stats
 		d.statsMu.Lock()
 		d.totalReceived++
 		d.statsMu.Unlock()
 
-		// Si on a reçu le datum, il faut aller chercher ses enfants
-		// (Récursion pour tout télécharger)
+		// Exploration des enfants (partie lente, découplée du timing réseau)
 		if datum, ok := d.server.Downloads.Get(hash); ok {
 			d.processChildren(datum)
 		}

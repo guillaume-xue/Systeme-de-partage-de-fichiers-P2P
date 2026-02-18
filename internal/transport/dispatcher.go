@@ -39,20 +39,12 @@ func (d *DatumDispatcher) remove(id int64) {
 	d.mu.Unlock()
 }
 
-// Dispatch envoie la donnée à tout le monde
+// Dispatch envoie la donnée à tous les subscribers (appel synchrone)
 func (d *DatumDispatcher) Dispatch(hash [32]byte, datum []byte) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
 	for _, handler := range d.subscribers {
-		go func(h DatumHandler) {
-			// Protège contre les panics
-			defer func() {
-				if r := recover(); r != nil {
-					// On ignore les panics dans les handlers
-				}
-			}()
-			h(hash, datum)
-		}(handler)
+		handler(hash, datum)
 	}
 }

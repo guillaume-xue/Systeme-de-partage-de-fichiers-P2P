@@ -217,11 +217,9 @@ func (d *DiskDownloader) onDatumReceived(hash [32]byte, data []byte) {
 		d.structureCacheMu.Unlock()
 	}
 
-	// Signal réception
-	select {
-	case d.responseCh <- hash:
-	default:
-	}
+	// Signal garanti : goroutine pour ne pas bloquer le callback UDP
+	// et ne jamais perdre de signal (sinon enfants jamais explorés)
+	go func() { d.responseCh <- hash }()
 }
 
 // writeTempChunk écrit un chunk sur le disque dans le dossier temp
