@@ -31,9 +31,14 @@ type Downloader struct {
 
 	// Stats de progression
 	totalReceived int
-	successCount  int // Compteur de succès consécutifs
-	failureCount  int // Compteur d'échecs récents
 	statsMu       sync.Mutex
+
+	// RTT estimation (RFC 6298) + contrôle de congestion
+	srtt     time.Duration // Moyenne lissée du RTT
+	rttvar   time.Duration // Variance lissée du RTT
+	rto      time.Duration // Timeout de retransmission dynamique
+	rttInit  bool          // Premier échantillon RTT reçu ?
+	ssthresh int           // Seuil slow-start / congestion avoidance
 
 	// Communication interne
 	workCh     chan [32]byte // File d'attente des hash à demander
@@ -56,6 +61,10 @@ func NewDownloader(server *Server, peerAddr *net.UDPAddr) *Downloader {
 		maxWindowSize: config.GlobalConfig.Network.MaxWindowSize,
 		minWindowSize: config.GlobalConfig.Network.MinWindowSize,
 		timeout:       config.GlobalConfig.Network.TimeoutDownload,
+
+		// RTT init
+		rto:      config.GlobalConfig.Network.TimeoutDownload, // RTO initial = timeout config
+		ssthresh: config.GlobalConfig.Network.MaxWindowSize,   // Slow-start jusqu'à maxWindow
 
 		pending: make(map[[32]byte]time.Time),
 		retries: make(map[[32]byte]int),
@@ -170,9 +179,15 @@ func (d *Downloader) responseLoop() {
 	for hash := range d.responseCh {
 		d.mu.Lock()
 		sentAt, ok := d.pending[hash]
+		wasRetried := d.retries[hash] > 0 // Algorithme de Karn
 		if ok {
 			responseTime := time.Since(sentAt)
-			d.adjustWindowOnSuccessDownloader(responseTime)
+			// Karn : pas de mise à jour RTT sur retransmission
+			if !wasRetried {
+				d.updateRTTAndWindow(responseTime)
+			} else {
+				d.growWindowOnly(responseTime)
+			}
 			d.removeFromPendingDownloader(hash)
 		}
 		d.mu.Unlock()
@@ -203,6 +218,8 @@ func (d *Downloader) monitorLoop() {
 		d.mu.Lock()
 		inflightCount := len(d.pending)
 		windowSize := d.windowSize
+		rtt := d.srtt
+		rto := d.rto
 
 		queuedCount := len(d.workCh)
 
@@ -211,8 +228,9 @@ func (d *Downloader) monitorLoop() {
 		d.statsMu.Unlock()
 
 		fmt.Printf("\r%-100s\r", "") // Nettoyer avec 100 espaces
-		fmt.Printf("📊 Progression: %d reçus | En cours: %d | File d'attente: %d | Fenêtre: %d",
-			received, inflightCount, queuedCount, windowSize)
+		fmt.Printf("📊 %d reçus | Vol: %d | File: %d | Fen: %d | RTT: %s | RTO: %s",
+			received, inflightCount, queuedCount, windowSize,
+			rtt.Round(time.Millisecond), rto.Round(time.Millisecond))
 
 		// Si plus rien en vol et plus rien à faire...
 		if inflightCount == 0 && queuedCount == 0 {
@@ -235,7 +253,7 @@ func (d *Downloader) monitorLoop() {
 		timeoutDetected := false
 
 		for h, t := range d.pending {
-			if now.Sub(t) > d.timeout {
+			if now.Sub(t) > d.rto {
 				d.retries[h]++
 				if d.retries[h] > 3 {
 					fmt.Printf("⚠️ Timeout définitif sur %x\n", h)
@@ -249,7 +267,7 @@ func (d *Downloader) monitorLoop() {
 		}
 
 		if timeoutDetected {
-			d.adjustWindowOnFailure()
+			d.onTimeoutDecrease()
 		}
 		d.mu.Unlock()
 
@@ -290,26 +308,63 @@ func (d *Downloader) queueHash(h [32]byte) {
 	}
 }
 
-// adjustWindowOnSuccessDownloader ajuste la fenêtre après un succès
-func (d *Downloader) adjustWindowOnSuccessDownloader(responseTime time.Duration) {
-	d.successCount++
-	d.failureCount = 0
+// updateRTTAndWindow met à jour l'estimation RTT (RFC 6298) et ajuste la fenêtre.
+// Constantes RFC 6298 :  α = 1/8 (SRTT), β = 1/4 (RTTVAR), K = 4 (RTO)
+// Fenêtre : Slow Start (< ssthresh) +2/ACK, Congestion Avoidance (>= ssthresh) +1/ACK
+func (d *Downloader) updateRTTAndWindow(sample time.Duration) {
+	// 1. Mise à jour RTT (RFC 6298 Sections 2.2 & 2.3)
+	if !d.rttInit {
+		d.srtt = sample
+		d.rttvar = sample / 2
+		d.rttInit = true
+	} else {
+		diff := d.srtt - sample
+		if diff < 0 {
+			diff = -diff
+		}
+		d.rttvar = (3*d.rttvar + diff) / 4 // β = 1/4
+		d.srtt = (7*d.srtt + sample) / 8   // α = 1/8
+	}
 
-	if responseTime < d.timeout/2 && d.windowSize < d.maxWindowSize {
-		d.windowSize++
+	// 2. RTO = SRTT + 4 * RTTVAR (borné)
+	rto := min(max(d.srtt+4*d.rttvar, 50*time.Millisecond), d.timeout)
+	d.rto = rto
+
+	// 3. Fenêtre : grandir seulement si latence ≤ moyenne
+	if sample <= d.srtt && d.windowSize < d.maxWindowSize {
+		if d.windowSize < d.ssthresh {
+			d.windowSize += 2
+		} else {
+			d.windowSize++
+		}
+		if d.windowSize > d.maxWindowSize {
+			d.windowSize = d.maxWindowSize
+		}
 	}
 }
 
-// adjustWindowOnFailure réduit la fenêtre après des échecs
-func (d *Downloader) adjustWindowOnFailure() {
-	d.failureCount++
-	d.successCount = 0
-
-	if d.failureCount > 2 && d.windowSize > d.minWindowSize {
-		newWin := (d.windowSize * 3) / 5
-		d.windowSize = utils.MaxInt(newWin, d.minWindowSize)
-		d.failureCount = 0
+// growWindowOnly ajuste la fenêtre sans toucher au RTT (Karn : paquet retransmis)
+func (d *Downloader) growWindowOnly(sample time.Duration) {
+	if !d.rttInit {
+		return
 	}
+	if sample <= d.srtt && d.windowSize < d.maxWindowSize {
+		if d.windowSize < d.ssthresh {
+			d.windowSize += 2
+		} else {
+			d.windowSize++
+		}
+		if d.windowSize > d.maxWindowSize {
+			d.windowSize = d.maxWindowSize
+		}
+	}
+}
+
+// onTimeoutDecrease réduit la fenêtre (multiplicative decrease) et double le RTO
+func (d *Downloader) onTimeoutDecrease() {
+	d.ssthresh = utils.MaxInt(d.windowSize/2, d.minWindowSize)
+	d.windowSize = utils.MaxInt(d.windowSize/2, d.minWindowSize)
+	d.rto = min(d.rto*2, d.timeout)
 }
 
 // removeFromPendingDownloader retire un hash de pending et retries

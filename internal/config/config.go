@@ -100,8 +100,8 @@ func DefaultConfig() *Config {
 			MaxWindowSize:          256,
 			InitialWindow:          10,
 			MinWindowSize:          2,
-			TimeoutSecondsDownload: 1,
-			TimeoutDownload:        1 * time.Second,
+			TimeoutSecondsDownload: 3,
+			TimeoutDownload:        3 * time.Second,
 			ProcessorWorkers:       20,
 		},
 		Merkle: MerkleConfig{

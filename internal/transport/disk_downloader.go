@@ -58,11 +58,16 @@ type DiskDownloader struct {
 	structureCacheMu   sync.RWMutex
 
 	// Stats
-	savedFiles   int
-	savedBytes   int64
-	successCount int // Compteur de succès consécutifs
-	failureCount int // Compteur d'échecs récents
-	statsMu      sync.Mutex
+	savedFiles int
+	savedBytes int64
+	statsMu    sync.Mutex
+
+	// RTT estimation (RFC 6298) + contrôle de congestion
+	srtt     time.Duration // Moyenne lissée du RTT
+	rttvar   time.Duration // Variance lissée du RTT
+	rto      time.Duration // Timeout de retransmission dynamique
+	rttInit  bool          // Premier échantillon RTT reçu ?
+	ssthresh int           // Seuil slow-start / congestion avoidance
 
 	// Lifecycle
 	wg          sync.WaitGroup
@@ -94,6 +99,10 @@ func NewDiskDownloader(server *Server, peer *net.UDPAddr, output string) *DiskDo
 		maxWindow: config.GlobalConfig.Network.MaxWindowSize,
 		minWindow: config.GlobalConfig.Network.MinWindowSize,
 		timeout:   config.GlobalConfig.Network.TimeoutDownload,
+
+		// RTT init
+		rto:      config.GlobalConfig.Network.TimeoutDownload, // RTO initial = timeout config
+		ssthresh: config.GlobalConfig.Network.MaxWindowSize,   // Slow-start jusqu'à maxWindow
 
 		inflight: make(map[[32]byte]time.Time),
 		retries:  make(map[[32]byte]int),
@@ -175,11 +184,17 @@ func (d *DiskDownloader) onDatumReceived(hash [32]byte, data []byte) {
 	// retirer de inflight tds pour éviter les faux timeouts
 	d.pendingMu.Lock()
 	start, wasInflight := d.inflight[hash]
+	wasRetried := d.retries[hash] > 0 // Algorithme de Karn
 	d.pendingMu.Unlock()
 
 	if wasInflight {
 		responseTime := time.Since(start)
-		d.adjustWindowOnSuccess(responseTime)
+		// Karn : pas de mise à jour RTT sur retransmission
+		if !wasRetried {
+			d.updateRTTAndWindow(responseTime)
+		} else {
+			d.growWindowOnly(responseTime)
+		}
 		d.removeFromInflight(hash)
 	}
 
@@ -319,17 +334,51 @@ func (d *DiskDownloader) recordSuccess(size int64) {
 	d.statsMu.Unlock()
 }
 
-// adjustWindowOnSuccess ajuste la fenêtre après un succès
-func (d *DiskDownloader) adjustWindowOnSuccess(responseTime time.Duration) {
+// updateRTTAndWindow met à jour le RTT (RFC 6298) et ajuste la fenêtre.
+func (d *DiskDownloader) updateRTTAndWindow(sample time.Duration) {
 	d.pendingMu.Lock()
 	defer d.pendingMu.Unlock()
 
-	d.successCount++
-	d.failureCount = 0
+	if !d.rttInit {
+		d.srtt = sample
+		d.rttvar = sample / 2
+		d.rttInit = true
+	} else {
+		diff := d.srtt - sample
+		if diff < 0 {
+			diff = -diff
+		}
+		d.rttvar = (3*d.rttvar + diff) / 4 // β = 1/4
+		d.srtt = (7*d.srtt + sample) / 8   // α = 1/8
+	}
 
-	// Augmenter la fenêtre seulement si réponse rapide
-	if responseTime < d.timeout/2 && d.window < d.maxWindow {
-		if d.window < d.maxWindow/2 {
+	// RTO = SRTT + 4 * RTTVAR, borné [50ms, timeout]
+	d.rto = min(max(d.srtt+4*d.rttvar, 50*time.Millisecond), d.timeout)
+
+	// Fenêtre : grandir si latence ≤ moyenne
+	if sample <= d.srtt && d.window < d.maxWindow {
+		if d.window < d.ssthresh {
+			d.window += 2 // Slow Start
+		} else {
+			d.window++ // Congestion Avoidance
+		}
+		if d.window > d.maxWindow {
+			d.window = d.maxWindow
+		}
+	}
+}
+
+// growWindowOnly ajuste la fenêtre sans toucher au RTT (Karn : paquet retransmis)
+func (d *DiskDownloader) growWindowOnly(sample time.Duration) {
+	d.pendingMu.Lock()
+	defer d.pendingMu.Unlock()
+
+	if !d.rttInit {
+		return
+	}
+
+	if sample <= d.srtt && d.window < d.maxWindow {
+		if d.window < d.ssthresh {
 			d.window += 2
 		} else {
 			d.window++
@@ -438,14 +487,17 @@ func (d *DiskDownloader) monitorLoop() {
 		inflight, queued, response, processing := d.getCompletionStatus()
 		d.pendingMu.Lock()
 		windowSize := d.window
+		rtt := d.srtt
+		rto := d.rto
 		d.pendingMu.Unlock()
 
 		// Affichage des stats
 		savedFiles, savedBytes := d.getStats()
 
 		fmt.Printf("\r%-100s\r", "") // Nettoyer la ligne
-		fmt.Printf("💾 Téléchargement: (%d fichiers, %s) | En cours: %d | File: %d | Fenêtre: %d",
-			savedFiles, utils.FormatBytesInt64(savedBytes), inflight, queued, windowSize)
+		fmt.Printf("💾 DL: (%d fichiers, %s) | Vol: %d | File: %d | Fen: %d | RTT: %s | RTO: %s",
+			savedFiles, utils.FormatBytesInt64(savedBytes), inflight, queued, windowSize,
+			rtt.Round(time.Millisecond), rto.Round(time.Millisecond))
 
 		// Logique de fin
 		if inflight == 0 && queued == 0 && response == 0 && processing == 0 {
@@ -478,31 +530,25 @@ func (d *DiskDownloader) handleTimeouts() [][32]byte {
 	var retryList [][32]byte
 
 	for hash, sentAt := range d.inflight {
-		if now.Sub(sentAt) > d.timeout {
+		if now.Sub(sentAt) > d.rto {
 			timeoutCount++
 			d.retries[hash]++
 			if d.retries[hash] > 3 {
-				// Trop d'échecs, on abandonne ce chunk
 				fmt.Printf("\n⚠️ Abandon définitif chunk %x\n", hash)
 				delete(d.inflight, hash)
 				delete(d.retries, hash)
 			} else {
-				// Retry - ajouter à la liste pour renvoyer
 				retryList = append(retryList, hash)
-				d.inflight[hash] = now // Reset timer
+				d.inflight[hash] = now
 			}
 		}
 	}
 
-	// Ajuster la fenêtre seulement si taux d'échec significatif
+	// Multiplicative decrease + back-off RTO
 	if timeoutCount > 0 {
-		d.failureCount += timeoutCount
-		d.successCount = 0
-
-		if d.failureCount > 2 && d.window > d.minWindow {
-			d.window = utils.MaxInt((d.window*3)/5, d.minWindow) // -40%
-			d.failureCount = 0
-		}
+		d.ssthresh = utils.MaxInt(d.window/2, d.minWindow)
+		d.window = utils.MaxInt(d.window/2, d.minWindow)
+		d.rto = min(d.rto*2, d.timeout)
 	}
 
 	return retryList
