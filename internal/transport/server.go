@@ -31,6 +31,13 @@ type Server struct {
 	PingResponseChans map[string]chan *net.UDPAddr
 	PingResponseMu    sync.Mutex
 
+	// Sécurité : suivi des requêtes en attente (anti-injection)
+	// Hash → set d'adresses de peers à qui on a demandé ce datum
+	PendingDatumRequests map[[32]byte]map[string]struct{}
+	PendingDatumMu       sync.RWMutex
+	PendingRootRequests  map[string]struct{} // Adresses à qui on a envoyé un RootRequest
+	PendingRootRequestMu sync.Mutex
+
 	// Cache HTTP pour éviter de spammer l'annuaire
 	keyCache   map[string][]byte
 	keyCacheMu sync.RWMutex
@@ -43,17 +50,19 @@ type Server struct {
 
 func NewServer(conn *net.UDPConn, key *ecdsa.PrivateKey, name string) *Server {
 	return &Server{
-		Conn:              conn,
-		PrivKey:           key,
-		MyName:            name,
-		Manager:           peer.NewManager(),
-		MerkleStore:       merkle.NewStore(),
-		Downloads:         merkle.NewStore(),
-		DatumDispatcher:   NewDatumDispatcher(),
-		keyCache:          make(map[string][]byte),
-		PingResponseChans: make(map[string]chan *net.UDPAddr),
-		workerSem:         make(chan struct{}, 100), // Limite à 100 workers concurrents
-		shutdown:          make(chan struct{}),
+		Conn:                 conn,
+		PrivKey:              key,
+		MyName:               name,
+		Manager:              peer.NewManager(),
+		MerkleStore:          merkle.NewStore(),
+		Downloads:            merkle.NewStore(),
+		DatumDispatcher:      NewDatumDispatcher(),
+		keyCache:             make(map[string][]byte),
+		PingResponseChans:    make(map[string]chan *net.UDPAddr),
+		PendingDatumRequests: make(map[[32]byte]map[string]struct{}),
+		PendingRootRequests:  make(map[string]struct{}),
+		workerSem:            make(chan struct{}, 100), // Limite à 100 workers concurrents
+		shutdown:             make(chan struct{}),
 	}
 }
 

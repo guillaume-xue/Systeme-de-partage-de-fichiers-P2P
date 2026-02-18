@@ -181,7 +181,8 @@ func (d *Downloader) senderLoop() {
 		d.pending[hash] = time.Now()
 		d.mu.Unlock()
 
-		// 5. Send
+		// 5. Send (enregistrer d'abord pour la sécurité)
+		d.server.RegisterDatumRequest(hash, d.peerAddr)
 		SendDatumRequest(d.server.Conn, d.peerAddr, hash)
 	}
 }
@@ -255,6 +256,7 @@ func (d *Downloader) monitorLoop() {
 				if d.retries[h] > 3 {
 					fmt.Printf("⚠️ Timeout définitif sur %x\n", h)
 					delete(d.pending, h)
+					d.server.UnregisterDatumRequest(h, d.peerAddr)
 				} else {
 					retryList = append(retryList, h)
 					d.pending[h] = now

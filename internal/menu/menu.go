@@ -506,7 +506,9 @@ func (m *InteractiveMenu) getRootHashFromPeer(pInfo *peer.PeerInfo, pName string
 	fmt.Printf("🔍 Demande du hash racine à %s...\n", pName)
 	m.rootHashChan = make(chan [32]byte, 1)
 	m.server.SetRootHashChan(m.rootHashChan)
-	transport.SendRootRequest(m.server.Conn, pInfo.GetAddr())
+	peerAddr := pInfo.GetAddr()
+	m.server.RegisterRootRequest(peerAddr)
+	transport.SendRootRequest(m.server.Conn, peerAddr)
 
 	fmt.Println("⌛ En attente de la réponse...")
 
@@ -517,6 +519,7 @@ func (m *InteractiveMenu) getRootHashFromPeer(pInfo *peer.PeerInfo, pName string
 		targetHash = tmpHash
 	case <-time.After(3 * time.Second):
 		fmt.Println("⏳ Timeout: pas de réponse reçue (3s)")
+		m.server.UnregisterRootRequest(peerAddr)
 	}
 
 	m.server.SetRootHashChan(nil)

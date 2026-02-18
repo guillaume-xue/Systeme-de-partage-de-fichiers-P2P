@@ -272,6 +272,7 @@ func (d *DiskDownloader) senderLoop() {
 			d.inflight[tache.hash] = time.Now()
 			d.pendingMu.Unlock()
 
+			d.server.RegisterDatumRequest(tache.hash, d.peer)
 			SendDatumRequest(d.server.Conn, d.peer, tache.hash)
 		case <-d.done:
 			return
@@ -535,6 +536,7 @@ func (d *DiskDownloader) handleTimeouts() [][32]byte {
 				fmt.Printf("\n⚠️ Abandon définitif chunk %x\n", hash)
 				delete(d.inflight, hash)
 				delete(d.retries, hash)
+				d.server.UnregisterDatumRequest(hash, d.peer)
 			} else {
 				retryList = append(retryList, hash)
 				d.inflight[hash] = now

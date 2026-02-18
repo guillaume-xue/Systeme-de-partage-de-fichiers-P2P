@@ -87,7 +87,7 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
 			return
 		}
-		s.onDatum(pkt)
+		s.onDatum(pkt, addr)
 
 	case protocol.NoDatum:
 		// Juste pour info/debug
@@ -120,7 +120,60 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 	}
 }
 
-// --- Handlers Spécifiques ---
+// RegisterDatumRequest enregistre un hash + adresse pour n'accepter que les réponses du bon peer
+func (s *Server) RegisterDatumRequest(hash [32]byte, addr *net.UDPAddr) {
+	s.PendingDatumMu.Lock()
+	if s.PendingDatumRequests[hash] == nil {
+		s.PendingDatumRequests[hash] = make(map[string]struct{})
+	}
+	s.PendingDatumRequests[hash][addr.String()] = struct{}{}
+	s.PendingDatumMu.Unlock()
+}
+
+// UnregisterDatumRequest supprime un hash+addr des requêtes en attente
+func (s *Server) UnregisterDatumRequest(hash [32]byte, addr *net.UDPAddr) {
+	s.PendingDatumMu.Lock()
+	if peers, ok := s.PendingDatumRequests[hash]; ok {
+		delete(peers, addr.String())
+		if len(peers) == 0 {
+			delete(s.PendingDatumRequests, hash)
+		}
+	}
+	s.PendingDatumMu.Unlock()
+}
+
+// IsDatumExpected vérifie qu'on a bien demandé ce datum à ce peer précis
+func (s *Server) IsDatumExpected(hash [32]byte, addr *net.UDPAddr) bool {
+	s.PendingDatumMu.RLock()
+	peers, ok := s.PendingDatumRequests[hash]
+	if ok {
+		_, ok = peers[addr.String()]
+	}
+	s.PendingDatumMu.RUnlock()
+	return ok
+}
+
+// RegisterRootRequest enregistre qu'on attend un RootReply d'une adresse donnée
+func (s *Server) RegisterRootRequest(addr *net.UDPAddr) {
+	s.PendingRootRequestMu.Lock()
+	s.PendingRootRequests[addr.String()] = struct{}{}
+	s.PendingRootRequestMu.Unlock()
+}
+
+// UnregisterRootRequest supprime une adresse des RootRequest en attente
+func (s *Server) UnregisterRootRequest(addr *net.UDPAddr) {
+	s.PendingRootRequestMu.Lock()
+	delete(s.PendingRootRequests, addr.String())
+	s.PendingRootRequestMu.Unlock()
+}
+
+// IsRootReplyExpected vérifie qu'on attend un RootReply de cette adresse
+func (s *Server) IsRootReplyExpected(addr *net.UDPAddr) bool {
+	s.PendingRootRequestMu.Lock()
+	_, ok := s.PendingRootRequests[addr.String()]
+	s.PendingRootRequestMu.Unlock()
+	return ok
+}
 
 func (s *Server) onHello(pkt *protocol.Packet, addr *net.UDPAddr, isReply bool) {
 	extensions, name, err := protocol.DecodeHelloBody(pkt.Body)
@@ -179,9 +232,15 @@ func (s *Server) onDatumRequest(pkt *protocol.Packet, addr *net.UDPAddr) {
 	}
 }
 
-func (s *Server) onDatum(pkt *protocol.Packet) {
+func (s *Server) onDatum(pkt *protocol.Packet, addr *net.UDPAddr) {
 	hash, val, err := protocol.DecodeDatumBody(pkt.Body)
 	if err != nil {
+		return
+	}
+
+	// Vérifier qu'on a bien demandé ce datum à CE peer
+	if !s.IsDatumExpected(hash, addr) {
+		fmt.Printf("⚠️ Datum non sollicité reçu de %s (hash %x...), ignoré\n", addr, hash[:8])
 		return
 	}
 
@@ -190,6 +249,9 @@ func (s *Server) onDatum(pkt *protocol.Packet) {
 		fmt.Println("❌ Datum corrompu reçu (Hash mismatch)")
 		return
 	}
+
+	// Retirer des requêtes en attente (on ne l'attend plus)
+	s.UnregisterDatumRequest(hash, addr)
 
 	// Stockage
 	s.Downloads.Set(hash, val)
@@ -204,7 +266,16 @@ func (s *Server) onRootReply(pkt *protocol.Packet, addr *net.UDPAddr) {
 		return
 	}
 
+	// Vérifier qu'on a bien demandé un RootRequest à ce peer
+	if !s.IsRootReplyExpected(addr) {
+		fmt.Printf("⚠️ RootReply non sollicité de %s, ignoré\n", addr)
+		return
+	}
+
 	fmt.Printf("🌳 Réception root hash %x... de %s\n", rootHash, addr)
+
+	// Retirer des requêtes en attente
+	s.UnregisterRootRequest(addr)
 
 	// Vérif signature
 	peer, ok := s.Manager.GetByAddr(addr)
