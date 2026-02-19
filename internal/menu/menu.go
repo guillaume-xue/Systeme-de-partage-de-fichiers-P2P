@@ -131,7 +131,7 @@ func (m *InteractiveMenu) listDirectoryPeers(print_or_other, disk_cache bool, ct
 
 }
 
-// 2. Se connecter à un pair (Direct + NAT Traversal)
+// Se connecter à un pair (Direct + NAT Traversal)
 func (m *InteractiveMenu) connectToPeer(pName string) {
 	_, ok := m.server.Manager.Get(pName)
 	if ok {
@@ -235,7 +235,7 @@ func (m *InteractiveMenu) connectToPeer(pName string) {
 	// m.waitKey()
 }
 
-// 3. Explorer
+// 2. Explorer
 func (m *InteractiveMenu) explorePeer(pName string, pInfo *peer.PeerInfo) {
 	if pInfo == nil {
 		return
@@ -308,41 +308,71 @@ func (m *InteractiveMenu) explorePeer(pName string, pInfo *peer.PeerInfo) {
 	m.waitKey()
 }
 
-// 4. Téléchargement via hash
+// 3. Téléchargement via hash ou chemin
 func (m *InteractiveMenu) downloadManual(pName string, pInfo *peer.PeerInfo, ctx context.Context) {
 	if pInfo == nil {
 		return
 	}
 
-	hashInput := m.ask("Hash du datum (hex, ou 'root' pour la racine): ")
+	fmt.Println("\n--- Mode de téléchargement ---")
+	fmt.Println("  Appuyez sur Entrée pour télécharger depuis la racine")
+	fmt.Println("  Entrez un hash hex pour télécharger depuis ce hash")
+	fmt.Println("  Entrez un chemin (ex: dir/subdir, ./pictures) pour naviguer par nom")
+	input := m.ask("Cible : ")
 
 	var targetHash [32]byte
-	if hashInput == "root" {
+	input = strings.TrimSpace(input)
+	peerAddr := pInfo.GetAddr()
+
+	if input == "" {
+		// Mode par défaut : récupérer le root hash du peer
 		targetHash = m.getRootHashFromPeer(pInfo, pName)
 		if targetHash == ([32]byte{}) {
 			return
 		}
-	} else {
-		parsedHash, err := utils.ParseHash(hashInput)
+	} else if looksLikeHash(input) {
+		// Mode hash : on télécharge directement depuis ce hash
+		parsedHash, err := utils.ParseHash(input)
 		if err != nil {
+			fmt.Printf("❌ Hash invalide : %v\n", err)
 			return
 		}
 		targetHash = parsedHash
+	} else {
+		// Résolution lazy (fetch datum par datum le long du chemin)
+		rootHash := m.getRootHashFromPeer(pInfo, pName)
+		if rootHash == ([32]byte{}) {
+			return
+		}
+
+		fmt.Printf("🔍 Résolution du chemin '%s'...\n", input)
+		fetcher := func(hash [32]byte) ([]byte, error) {
+			return m.server.FetchDatum(peerAddr, hash, 3*time.Second)
+		}
+		resolved, err := utils.ResolvePathLazy(fetcher, rootHash, input)
+		if err != nil {
+			fmt.Printf("❌ Chemin introuvable : %v\n", err)
+			m.waitKey()
+			return
+		}
+		fmt.Printf("✅ Chemin résolu : %s -> %x\n", input, resolved)
+		targetHash = resolved
 	}
+
 	// Gestion Ctrl+C
 	dlCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
 	destDir := filepath.Join("downloads", utils.CleanName(pName))
 	fmt.Printf("📂 Destination: %s\n", destDir)
-	diskDownloader := transport.NewDiskDownloader(m.server, pInfo.GetAddr(), destDir)
+	diskDownloader := transport.NewDiskDownloader(m.server, peerAddr, destDir)
 	if err := diskDownloader.DownloadToDisk(dlCtx, targetHash); err != nil {
 		fmt.Printf("❌ Erreur lors du téléchargement: %v\n", err)
 	}
 	m.waitKey()
 }
 
-// 5. Affichage des connexions
+// 4. Affichage des connexions
 func (m *InteractiveMenu) showConnections() {
 	connectedPeers := m.server.Manager.List()
 
@@ -368,7 +398,7 @@ func (m *InteractiveMenu) showConnections() {
 	m.waitKey()
 }
 
-// 6. Affichage des fichiers locaux
+// 5. Affichage des fichiers locaux
 func (m *InteractiveMenu) showLocalFiles() {
 	if m.server.RootHash == [32]byte{} {
 		fmt.Println("\n📁 Aucun fichier partagé")
