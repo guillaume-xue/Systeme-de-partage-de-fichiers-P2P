@@ -52,32 +52,29 @@ func (m *InteractiveMenu) Run(ctx context.Context) {
 	for {
 		fmt.Println("\n	--- MENU ---")
 		fmt.Println("1. Peers disponibles")
-		fmt.Println("2. Connexion à un peer")
-		fmt.Println("3. Explorer fichiers distants")
-		fmt.Println("4. Télécharger un fichier")
-		fmt.Println("5. État des connexions")
-		fmt.Println("6. Mes fichiers")
-		fmt.Println("7. Activer le mode debug (afficher les datums)")
+		fmt.Println("2. Explorer fichiers distants")
+		fmt.Println("3. Télécharger un fichier")
+		fmt.Println("4. État des connexions")
+		fmt.Println("5. Mes fichiers")
+		fmt.Println("6. Activer le mode debug (afficher les datums)")
 		fmt.Println("0. Quitter")
 
 		choice := m.ask("\n> Choix : ")
 
 		switch choice {
 		case "1":
-			m.listDirectoryPeers()
+			m.listDirectoryPeers(false, false, ctx)
 		case "2":
-			m.connectToPeer()
+			m.listDirectoryPeers(true, false, ctx)
 		case "3":
-			m.explorePeer()
+			m.listDirectoryPeers(true, true, ctx)
 		case "4":
-			m.downloadManual(ctx)
-		case "5":
 			m.showConnections()
-		case "6":
+		case "5":
 			m.showLocalFiles()
-		case "7":
+		case "6":
 			protocol.Debug_Enable = !protocol.Debug_Enable
-			fmt.Printf("🔧 Mode debug (affichage datums) : %v\n", protocol.Debug_Enable)
+			fmt.Printf("🔧 Mode debug : %v\n", protocol.Debug_Enable)
 		case "0", "q":
 			m.server.Stop()
 			return
@@ -88,7 +85,7 @@ func (m *InteractiveMenu) Run(ctx context.Context) {
 }
 
 // 1. Lister les peers
-func (m *InteractiveMenu) listDirectoryPeers() {
+func (m *InteractiveMenu) listDirectoryPeers(print_or_other, disk_cache bool, ctx context.Context) {
 	fmt.Println("Récupération liste...")
 	peers, err := transport.GetListPeers()
 	if err != nil {
@@ -103,16 +100,44 @@ func (m *InteractiveMenu) listDirectoryPeers() {
 	for i, p := range peers {
 		fmt.Printf(" [%d] %s\n", i+1, p)
 	}
-	m.waitKey()
-}
 
-// 2. Se connecter à un pair (Direct + NAT Traversal)
-func (m *InteractiveMenu) connectToPeer() {
-	pName := m.ask("Nom du peer cible : ")
+	if !print_or_other {
+		m.waitKey()
+		return
+	}
+
+	pName := m.ask("Nom du peer cible / numéro : ")
 	if pName == "" {
 		fmt.Println("Nom de peer vide")
 		return
 	}
+
+	// Support choix par index
+	if pIndex, err := strconv.Atoi(pName); err == nil && pIndex > 0 && pIndex <= len(peers) {
+		pName = peers[pIndex-1]
+	}
+
+	pInfo, ok := m.server.Manager.Get(pName)
+	if !ok {
+		m.connectToPeer(pName)
+		pInfo, _ = m.server.Manager.Get(pName)
+	}
+
+	if disk_cache {
+		m.downloadManual(pName, pInfo, ctx)
+	} else {
+		m.explorePeer(pName, pInfo)
+	}
+
+}
+
+// 2. Se connecter à un pair (Direct + NAT Traversal)
+func (m *InteractiveMenu) connectToPeer(pName string) {
+	_, ok := m.server.Manager.Get(pName)
+	if ok {
+		return // Déjà connecté
+	}
+
 	// Récup ip, parser et filtrer
 	listAddr, err := transport.GetAddr(pName)
 	if err != nil {
@@ -164,11 +189,14 @@ func (m *InteractiveMenu) connectToPeer() {
 
 	// Phase 2: NAT traversal pour les protocoles qui ont échoué
 	if len(remainingTargets) > 0 {
-		fmt.Println("\n--- Choix du relais pour NAT traversal ---")
-		fmt.Println("Appuyez sur Entrée (ou tapez 'default') pour utiliser le serveur central")
-		fmt.Println("Ou entrez le nom d'un peer connecté pour l'utiliser comme relais")
-		choixRelais := m.ask("Relais : ")
-		choixRelais = strings.TrimSpace(choixRelais)
+		choixRelais := ""
+		if protocol.Debug_Enable {
+			fmt.Println("\n--- Choix du relais pour NAT traversal ---")
+			fmt.Println("Appuyez sur Entrée (ou tapez 'default') pour utiliser le serveur central")
+			fmt.Println("Ou entrez le nom d'un peer connecté pour l'utiliser comme relais")
+			choixRelais = m.ask("Relais : ")
+			choixRelais = strings.TrimSpace(choixRelais)
+		}
 
 		// Configurer les canaux de réception pour chaque adresse restante
 		responseChan := make(chan *net.UDPAddr, max(len(remainingTargets)*2, 10))
@@ -204,12 +232,11 @@ func (m *InteractiveMenu) connectToPeer() {
 	} else {
 		fmt.Println("❌ ÉCHEC : Impossible de joindre le peer.")
 	}
-	m.waitKey()
+	// m.waitKey()
 }
 
 // 3. Explorer
-func (m *InteractiveMenu) explorePeer() {
-	pInfo, pName := m.pickConnectedPeer()
+func (m *InteractiveMenu) explorePeer(pName string, pInfo *peer.PeerInfo) {
 	if pInfo == nil {
 		return
 	}
@@ -282,8 +309,7 @@ func (m *InteractiveMenu) explorePeer() {
 }
 
 // 4. Téléchargement via hash
-func (m *InteractiveMenu) downloadManual(ctx context.Context) {
-	pInfo, pName := m.pickConnectedPeer()
+func (m *InteractiveMenu) downloadManual(pName string, pInfo *peer.PeerInfo, ctx context.Context) {
 	if pInfo == nil {
 		return
 	}
@@ -522,35 +548,6 @@ func (m *InteractiveMenu) pingSpam(addresses []*net.UDPAddr, count int, response
 		return result
 	case <-time.After(500 * time.Millisecond):
 		return false
-	}
-}
-
-// Helper pour choisir un peer connecté
-func (m *InteractiveMenu) pickConnectedPeer() (*peer.PeerInfo, string) {
-	connectedPeers := m.server.Manager.List()
-	if len(connectedPeers) == 0 {
-		fmt.Println("Aucun peer connecté (utilisez l'option 2).")
-		return nil, ""
-	}
-
-	fmt.Println("Peers connectés:")
-	for i, pName := range connectedPeers {
-		fmt.Printf("  %d. %s\n", i+1, pName)
-	}
-
-	peerChoice := m.ask("Choix (nom ou numéro) : ")
-
-	// Support choix par index
-	if peerIndex, err := strconv.Atoi(peerChoice); err == nil && peerIndex > 0 && peerIndex <= len(connectedPeers) {
-		pInfo, _ := m.server.Manager.Get(connectedPeers[peerIndex-1])
-		return pInfo, connectedPeers[peerIndex-1]
-	}
-	// Support choix par nom
-	if pInfo, ok := m.server.Manager.Get(peerChoice); ok {
-		return pInfo, peerChoice
-	} else {
-		fmt.Printf("Peer '%s' non connecté\n", peerChoice)
-		return nil, ""
 	}
 }
 

@@ -177,6 +177,13 @@ func (d *DiskDownloader) stop() {
 	close(d.workQueue)
 	close(d.responseCh)
 	d.wg.Wait()
+
+	// Nettoyer les requêtes en attente pour éviter les entrées orphelines
+	d.pendingMu.Lock()
+	for hash := range d.inflight {
+		d.server.UnregisterDatumRequest(hash, d.peer)
+	}
+	d.pendingMu.Unlock()
 }
 
 // Callback UDP
@@ -514,6 +521,15 @@ func (d *DiskDownloader) monitorLoop() {
 
 		// Retransmission
 		for _, hash := range retryList {
+			// Vérifier si le datum a été reçu entre le timeout et le retry
+			if d.hasDatum(hash) {
+				d.removeFromInflight(hash)
+				d.server.UnregisterDatumRequest(hash, d.peer)
+				continue
+			}
+			// Re-enregistrer avant d'envoyer (la réponse précédente a pu
+			// consommer l'enregistrement entre le unlock et maintenant)
+			d.server.RegisterDatumRequest(hash, d.peer)
 			SendDatumRequest(d.server.Conn, d.peer, hash)
 		}
 	}

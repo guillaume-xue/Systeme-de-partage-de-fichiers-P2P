@@ -106,6 +106,13 @@ func (d *Downloader) Stop() {
 	close(d.responseCh)
 
 	d.wg.Wait()
+
+	// Nettoyer les requêtes en attente pour éviter les entrées orphelines
+	d.mu.Lock()
+	for hash := range d.pending {
+		d.server.UnregisterDatumRequest(hash, d.peerAddr)
+	}
+	d.mu.Unlock()
 }
 
 // DownloadTree est la méthode bloquante appelée par le Menu
@@ -286,6 +293,17 @@ func (d *Downloader) monitorLoop() {
 		d.mu.Unlock()
 
 		for _, h := range retryList {
+			// Vérifier si le datum a été reçu entre le timeout et le retry
+			if _, exists := d.server.Downloads.Get(h); exists {
+				d.mu.Lock()
+				d.removeFromPendingDownloader(h)
+				d.mu.Unlock()
+				d.server.UnregisterDatumRequest(h, d.peerAddr)
+				continue
+			}
+			// Re-enregistrer avant d'envoyer (la réponse précédente a pu
+			// consommer l'enregistrement entre le unlock et maintenant)
+			d.server.RegisterDatumRequest(h, d.peerAddr)
 			SendDatumRequest(d.server.Conn, d.peerAddr, h)
 		}
 	}

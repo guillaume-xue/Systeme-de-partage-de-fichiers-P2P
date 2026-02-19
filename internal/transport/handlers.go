@@ -229,10 +229,12 @@ func (s *Server) onDatumRequest(pkt *protocol.Packet, addr *net.UDPAddr) {
 	}
 
 	if ok {
-		fmt.Printf("✅ Envoi datum %x... à %s\n", hash[:8], addr)
+		if protocol.Debug_Enable {
+			fmt.Printf("✅ Envoi datum %x... à %s\n", hash, addr)
+		}
 		SendDatum(s.Conn, addr, hash, data, pkt.Header.ID)
 	} else {
-		fmt.Printf("❌ Datum %x... introuvable, envoi NoDatum à %s\n", hash[:8], addr)
+		fmt.Printf("❌ Datum %x... introuvable, envoi NoDatum à %s\n", hash, addr)
 		SendNoDatum(s.Conn, addr, hash, s.PrivKey, pkt.Header.ID)
 	}
 }
@@ -245,6 +247,11 @@ func (s *Server) onDatum(pkt *protocol.Packet, addr *net.UDPAddr) {
 
 	// Vérifier qu'on a bien demandé ce datum à CE peer
 	if !s.IsDatumExpected(hash, addr) {
+		// Si on a déjà ce datum, c'est un doublon inoffensif
+		// (réponse tardive suite à un retry dont l'original est arrivé entre-temps)
+		if _, alreadyHave := s.Downloads.Get(hash); alreadyHave {
+			return
+		}
 		fmt.Printf("⚠️ Datum non sollicité reçu de %s (hash %x...), ignoré\n", addr, hash[:8])
 		return
 	}
@@ -258,7 +265,7 @@ func (s *Server) onDatum(pkt *protocol.Packet, addr *net.UDPAddr) {
 	// Retirer des requêtes en attente (on ne l'attend plus)
 	s.UnregisterDatumRequest(hash, addr)
 
-	// Stockage
+	// Stockage (idempotent si doublon, pas grave)
 	s.Downloads.Set(hash, val)
 
 	// Notification aux downloaders en attente
