@@ -97,6 +97,12 @@ func run(ctx context.Context) error {
 		fmt.Printf("✅ Dossier partagé chargé (root: %x...)\n", rootHash)
 	}
 
+	// Surveillance automatique du dossier partagé
+	go merkle.WatchSharedDir(ctx, sharedDir, 5*time.Second, func(newStore *merkle.Store, newRoot [32]byte) {
+		server.SetMerkleRoot(newStore, newRoot)
+	})
+	fmt.Println("✅ Surveillance du dossier partagé activée (intervalle: 5s)")
+
 	// Démarrage des services
 	// Routine d'écoute
 	go server.ListenLoop(ctx)

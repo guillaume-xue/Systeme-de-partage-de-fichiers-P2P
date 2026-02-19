@@ -22,6 +22,7 @@ type Server struct {
 	MerkleStore *merkle.Store // Fichiers locaux
 	Downloads   *merkle.Store // Fichiers distants
 	RootHash    [32]byte
+	mu          sync.RWMutex // Protège MerkleStore et RootHash
 
 	// Events
 	DatumDispatcher *DatumDispatcher

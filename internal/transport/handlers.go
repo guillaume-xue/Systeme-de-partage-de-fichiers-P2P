@@ -66,7 +66,10 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 			return
 		}
 		fmt.Printf("🌳 Demande de root hash de %s\n", addr)
-		SendRootReply(s.Conn, addr, s.RootHash, s.PrivKey, pkt.Header.ID)
+		s.mu.RLock()
+		rootHash := s.RootHash
+		s.mu.RUnlock()
+		SendRootReply(s.Conn, addr, rootHash, s.PrivKey, pkt.Header.ID)
 
 	case protocol.RootReply:
 		if _, ok := s.Manager.GetByAddr(addr); !ok {
@@ -218,7 +221,9 @@ func (s *Server) onDatumRequest(pkt *protocol.Packet, addr *net.UDPAddr) {
 	// fmt.Printf("📦 Demande datum %x... de %s\n", hash[:8], addr)
 
 	// On cherche d'abord en local, sinon dans le cache téléchargé
+	s.mu.RLock()
 	data, ok := s.MerkleStore.Get(hash)
+	s.mu.RUnlock()
 	if !ok {
 		data, ok = s.Downloads.Get(hash)
 	}
@@ -479,8 +484,10 @@ func (s *Server) SetRootHashChan(ch chan [32]byte) {
 }
 
 func (s *Server) SetMerkleRoot(store *merkle.Store, root [32]byte) {
+	s.mu.Lock()
 	s.MerkleStore = store
 	s.RootHash = root
+	s.mu.Unlock()
 }
 
 // KeepAlive : Simple loop qui ping les copains
