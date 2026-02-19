@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"crypto/ecdsa"
+	"fmt"
 	"main/internal/merkle"
 	"main/internal/peer"
 	"main/internal/protocol"
@@ -110,4 +111,55 @@ func (s *Server) Stop() {
 	close(s.shutdown)
 	s.workerWg.Wait() // Attendre que tous les workers terminent
 	s.Conn.Close()
+}
+
+// FetchDatum récupère un datum unique depuis un peer.
+// Vérifie d'abord le cache local (Downloads), sinon envoie une DatumRequest
+// et attend la réponse via le dispatcher. Retourne le datum ou une erreur.
+func (s *Server) FetchDatum(peerAddr *net.UDPAddr, hash [32]byte, timeout time.Duration) ([]byte, error) {
+	// Vérifier le cache
+	if datum, ok := s.Downloads.Get(hash); ok {
+		return datum, nil
+	}
+
+	// S'abonner au dispatcher pour capter la réponse
+	received := make(chan []byte, 1)
+	unsubscribe := s.DatumDispatcher.Subscribe("fetch_single", func(h [32]byte, data []byte) {
+		if h == hash {
+			select {
+			case received <- data:
+			default:
+			}
+		}
+	})
+	defer unsubscribe()
+
+	// Envoyer la requête (avec retry)
+	maxRetries := 3
+	for attempt := range maxRetries {
+		s.RegisterDatumRequest(hash, peerAddr)
+		SendDatumRequest(s.Conn, peerAddr, hash)
+
+		retryTimeout := timeout
+		if attempt > 0 {
+			retryTimeout = timeout * time.Duration(1<<uint(attempt)) // backoff exponentiel
+		}
+
+		select {
+		case data := <-received:
+			s.UnregisterDatumRequest(hash, peerAddr)
+			// Vérifier aussi dans le store (le handler l'a peut-être déjà stocké)
+			if datum, ok := s.Downloads.Get(hash); ok {
+				return datum, nil
+			}
+			return data, nil
+		case <-time.After(retryTimeout):
+			s.UnregisterDatumRequest(hash, peerAddr)
+			if attempt < maxRetries-1 {
+				continue
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("timeout: datum %x introuvable après %d tentatives", hash, maxRetries)
 }

@@ -213,18 +213,71 @@ func (m *InteractiveMenu) explorePeer() {
 	if pInfo == nil {
 		return
 	}
-	targetHash := m.getRootHashFromPeer(pInfo, pName)
-	if targetHash == ([32]byte{}) {
-		return
+
+	fmt.Println("\n--- Mode d'exploration ---")
+	fmt.Println("  Appuyez sur Entrée pour explorer depuis la racine (root)")
+	fmt.Println("  Entrez un hash hex pour explorer depuis ce hash")
+	fmt.Println("  Entrez un chemin (ex: dir/subdir, ./pictures) pour naviguer par nom")
+	input := m.ask("Cible : ")
+
+	var targetHash [32]byte
+
+	input = strings.TrimSpace(input)
+	peerAddr := pInfo.GetAddr()
+
+	if input == "" {
+		// Mode par défaut : récupérer le root hash du peer
+		targetHash = m.getRootHashFromPeer(pInfo, pName)
+		if targetHash == ([32]byte{}) {
+			return
+		}
+	} else if looksLikeHash(input) {
+		// Mode hash : on explore directement depuis ce hash
+		parsedHash, err := utils.ParseHash(input)
+		if err != nil {
+			fmt.Printf("❌ Hash invalide : %v\n", err)
+			return
+		}
+		targetHash = parsedHash
+	} else {
+		// Résolution lazy (fetch datum par datum le long du chemin)
+		rootHash := m.getRootHashFromPeer(pInfo, pName)
+		if rootHash == ([32]byte{}) {
+			return
+		}
+
+		fmt.Printf("🔍 Résolution du chemin '%s'...\n", input)
+		fetcher := func(hash [32]byte) ([]byte, error) {
+			return m.server.FetchDatum(peerAddr, hash, 3*time.Second)
+		}
+		resolved, err := utils.ResolvePathLazy(fetcher, rootHash, input)
+		if err != nil {
+			fmt.Printf("❌ Chemin introuvable : %v\n", err)
+			m.waitKey()
+			return
+		}
+		fmt.Printf("✅ Chemin résolu : %s -> %x\n", input, resolved)
+		targetHash = resolved
 	}
 
-	// On télécharge uniquement la structure de l'arborescence
+	// Extraire le nom d'affichage depuis le chemin (dernier composant)
+	displayName := ""
+	if input != "" && input != "root" && !looksLikeHash(input) {
+		clean := strings.TrimRight(input, "/")
+		if idx := strings.LastIndex(clean, "/"); idx >= 0 {
+			displayName = clean[idx+1:]
+		} else {
+			displayName = clean
+		}
+	}
+
+	// On télécharge l'arborescence depuis le hash cible
 	fmt.Println("\n📥 Téléchargement de l'arborescence en cours...")
-	dl := transport.NewDownloader(m.server, pInfo.GetAddr())
+	dl := transport.NewDownloader(m.server, peerAddr)
 	dl.DownloadTree(targetHash)
 
 	fmt.Println("\n--- ARBORESCENCE DISTANTE ---")
-	utils.PrintTree(m.server.Downloads, targetHash, "", "", true)
+	utils.PrintTree(m.server.Downloads, targetHash, "", displayName, true)
 	m.waitKey()
 }
 
@@ -517,6 +570,7 @@ func (m *InteractiveMenu) getRootHashFromPeer(pInfo *peer.PeerInfo, pName string
 	case tmpHash := <-m.rootHashChan:
 		fmt.Println("✅ Réception du hash racine réussie")
 		targetHash = tmpHash
+		m.server.UnregisterRootRequest(peerAddr)
 	case <-time.After(3 * time.Second):
 		fmt.Println("⏳ Timeout: pas de réponse reçue (3s)")
 		m.server.UnregisterRootRequest(peerAddr)
@@ -549,4 +603,18 @@ func (m *InteractiveMenu) filterAddressesByProtocol(addresses []*net.UDPAddr) []
 	}
 
 	return filtered
+}
+
+// looksLikeHash vérifie si une chaîne ressemble à un hash hexadécimal (au moins 16 chars hex)
+func looksLikeHash(s string) bool {
+	s = strings.TrimPrefix(strings.TrimSpace(s), "0x")
+	if len(s) < 16 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }

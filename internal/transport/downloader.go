@@ -44,6 +44,10 @@ type Downloader struct {
 	workCh     chan [32]byte // File d'attente des hash à demander
 	responseCh chan [32]byte // Signal de réception
 
+	// Buffer de débordement pour ne jamais perdre de hash
+	overflowMu sync.Mutex
+	overflow   [][32]byte
+
 	done chan struct{}
 
 	// Contrôle
@@ -147,6 +151,9 @@ func (d *Downloader) senderLoop() {
 	defer d.wg.Done()
 
 	for d.running {
+		// 0. Vider le buffer de débordement si possible
+		d.drainOverflow()
+
 		// 1. Check Window
 		d.mu.Lock()
 		canSend := len(d.pending) < d.windowSize
@@ -231,14 +238,22 @@ func (d *Downloader) monitorLoop() {
 			rtt.Round(time.Millisecond), rto.Round(time.Millisecond))
 
 		// Si plus rien en vol et plus rien à faire...
-		if inflightCount == 0 && queuedCount == 0 {
+		d.overflowMu.Lock()
+		overflowCount := len(d.overflow)
+		d.overflowMu.Unlock()
+
+		if inflightCount == 0 && queuedCount == 0 && overflowCount == 0 {
 			// Petite sécurité : on lâche le lock, on attend un poil et on revérifie
 			// (Au cas où un packet est en cours de traitement dans responseLoop)
 			d.mu.Unlock()
 			time.Sleep(100 * time.Millisecond)
 			d.mu.Lock()
 
-			if len(d.pending) == 0 && len(d.workCh) == 0 {
+			d.overflowMu.Lock()
+			overflowCount = len(d.overflow)
+			d.overflowMu.Unlock()
+
+			if len(d.pending) == 0 && len(d.workCh) == 0 && overflowCount == 0 {
 				d.mu.Unlock()
 				close(d.done)
 				return
@@ -294,7 +309,9 @@ func (d *Downloader) processChildren(datum []byte) {
 	}
 }
 
-// Helper pour ajouter à la file sans bloquer
+// queueHash ajoute un hash à la file de travail sans jamais le perdre.
+// Si le channel est plein, le hash est stocké dans un buffer de débordement
+// qui sera vidé par senderLoop.
 func (d *Downloader) queueHash(h [32]byte) {
 	// On vérifie d'abord si on l'a pas déjà (évite de spammer le channel)
 	if _, ok := d.server.Downloads.Get(h); ok {
@@ -303,8 +320,36 @@ func (d *Downloader) queueHash(h [32]byte) {
 	select {
 	case d.workCh <- h:
 	default:
-		// fmt.Println("Queue full!")
+		// Channel plein → stocker dans le buffer de débordement
+		d.overflowMu.Lock()
+		d.overflow = append(d.overflow, h)
+		d.overflowMu.Unlock()
 	}
+}
+
+// drainOverflow tente de vider le buffer de débordement dans workCh.
+// Appelé régulièrement par senderLoop.
+func (d *Downloader) drainOverflow() {
+	d.overflowMu.Lock()
+	if len(d.overflow) == 0 {
+		d.overflowMu.Unlock()
+		return
+	}
+
+	var remaining [][32]byte
+	for _, h := range d.overflow {
+		// Vérifier si déjà téléchargé entre-temps
+		if _, ok := d.server.Downloads.Get(h); ok {
+			continue
+		}
+		select {
+		case d.workCh <- h:
+		default:
+			remaining = append(remaining, h)
+		}
+	}
+	d.overflow = remaining
+	d.overflowMu.Unlock()
 }
 
 // updateRTTAndWindow met à jour l'estimation RTT (RFC 6298) et ajuste la fenêtre.
