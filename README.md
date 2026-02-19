@@ -26,7 +26,7 @@ Le binaire `client` sera créé dans le répertoire courant.
 ./client
 ```
 
-Une fois le menu affiché, appuyez sur `7` pour activer le mode debug.
+Une fois le menu affiché, appuyez sur `6` pour activer le mode debug.
 
 ## OU
 ```bash
@@ -40,24 +40,22 @@ Après le démarrage, un menu interactif s'affiche :
 ```
 --- MENU ---
 1. Peers disponibles
-2. Connexion à un peer
-3. Explorer fichiers distants
-4. Télécharger un fichier
-5. État des connexions
-6. Mes fichiers
-7. Activer le mode debug
+2. Explorer fichiers distants
+3. Télécharger un fichier
+4. État des connexions
+5. Mes fichiers
+6. Activer le mode debug
 0. Quitter
 ```
 
 ### Options principales
 
 1. **Peers disponibles** : Liste tous les utilisateurs du réseau
-2. **Connexion à un peer** : Se connecte à un autre utilisateur
-3. **Explorer fichiers distants** : Parcourt les fichiers d'un autre
-4. **Télécharger un fichier** : Télécharge un fichier par son hash SHA256
-5. **État des connexions** : Affiche les connexions actives
-6. **Mes fichiers** : Affiche votre arborescence partagée
-7. **Mode debug** : Active/désactive l'affichage des paquets UDP
+2. **Explorer fichiers distants** : Parcourt les fichiers d'un autre
+3. **Télécharger un fichier** : Télécharge un fichier
+4. **État des connexions** : Affiche les connexions actives
+5. **Mes fichiers** : Affiche votre arborescence partagée
+6. **Mode debug** : Active/désactive l'affichage des paquets UDP
 0. **Quitter** : Ferme le client
 
 ## Auteurs
