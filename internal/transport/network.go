@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"encoding/binary"
 	"fmt"
+	"main/internal/config"
 	"main/internal/protocol"
 	"net"
 	"time"
@@ -24,7 +25,7 @@ func TryConnectWithFallback(name string, privKey *ecdsa.PrivateKey) (*net.UDPCon
 	// On essaie d'abord le Dual-Stack (IPv6 + IPv4)
 	// Note : Sur Windows, il faut configurer le registre pour que [::] écoute aussi IPv4, (QUEL GALERE BORDEL)
 	// Merci Go qui semble gérer ça de facon automatique
-	fmt.Println("🔌 Ouverture du socket UDP...")
+	fmt.Println("ℹ️️ Ouverture du socket UDP...")
 
 	// Ici on laisse l'OS choisir pour éviter les conflits "Address already in use".
 	addrV6, _ := net.ResolveUDPAddr("udp", "[::]:0")
@@ -63,7 +64,7 @@ func TryConnectWithFallback(name string, privKey *ecdsa.PrivateKey) (*net.UDPCon
 			continue
 		}
 
-		fmt.Printf("🔄 Tentative de connexion au serveur %s...\n", targetStr)
+		fmt.Printf("ℹ️️ Tentative de connexion au serveur %s...\n", targetStr)
 
 		// Envoi Hello
 		helloID, err := SendHello(conn, serverAddr, name, privKey)
@@ -74,7 +75,7 @@ func TryConnectWithFallback(name string, privKey *ecdsa.PrivateKey) (*net.UDPCon
 
 		// Attente réponse (bloquant avec timeout court)
 		if waitResponse(conn, helloID) {
-			fmt.Println("   ✨ Connexion établie !")
+			fmt.Println("   ✅ Connexion établie !")
 
 			// Si on est en dual stack, on envoie un ping sur l'autre protocole aussi
 			// pour que le serveur enregistre nos deux adresses (V4 et V6).
@@ -94,13 +95,13 @@ func TryConnectWithFallback(name string, privKey *ecdsa.PrivateKey) (*net.UDPCon
 	return nil, nil, fmt.Errorf("impossible de joindre le serveur (toutes tentatives échouées)")
 }
 
-// waitResponse attend un paquet spécifique pendant 2 secondes
+// waitResponse attend un paquet spécifique pendant la durée configurée
 func waitResponse(conn *net.UDPConn, expectedID uint32) bool {
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(config.GlobalConfig.Network.HandshakeTimeout)
 	conn.SetReadDeadline(deadline)
 	defer conn.SetReadDeadline(time.Time{})
 
-	buf := make([]byte, 2048)
+	buf := make([]byte, config.GlobalConfig.Network.HandshakeBufferSize)
 
 	for {
 		// On calcule le temps restant

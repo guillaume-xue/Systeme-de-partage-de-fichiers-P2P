@@ -3,8 +3,10 @@ package menu
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"main/internal/config"
+	"main/internal/merkle"
 	"main/internal/peer"
 	"main/internal/protocol"
 	"main/internal/transport"
@@ -22,12 +24,11 @@ import (
 */
 
 type InteractiveMenu struct {
-	server       *transport.Server
-	serverAddr   *net.UDPAddr
-	scanner      *bufio.Scanner
-	rootHashChan chan [32]byte
-	hasIPv4      bool
-	hasIPv6      bool
+	server     *transport.Server
+	serverAddr *net.UDPAddr
+	scanner    *bufio.Scanner
+	hasIPv4    bool
+	hasIPv6    bool
 }
 
 func NewMenu(server *transport.Server, serverAddr *net.UDPAddr) *InteractiveMenu {
@@ -57,35 +58,43 @@ func (m *InteractiveMenu) Run(ctx context.Context) {
 		fmt.Println("4. État des connexions")
 		fmt.Println("5. Mes fichiers")
 		fmt.Println("6. Activer le mode debug (afficher les datums)")
+		if protocol.DebugEnabled {
+			fmt.Println("7. Connexion manuelle")
+		}
 		fmt.Println("0. Quitter")
 
 		choice := m.ask("\n> Choix : ")
 
 		switch choice {
 		case "1":
-			m.listDirectoryPeers(false, false, ctx)
+			m.listDirectoryPeers(false, false, ctx) // Juste liste, pas d'exploration ni téléchargement
 		case "2":
-			m.listDirectoryPeers(true, false, ctx)
+			m.listDirectoryPeers(true, false, ctx) // Exploration en mémoire (pas de sauvegarde sur disque)
 		case "3":
-			m.listDirectoryPeers(true, true, ctx)
+			m.listDirectoryPeers(true, true, ctx) // Téléchargement sur disque
 		case "4":
 			m.showConnections()
 		case "5":
 			m.showLocalFiles()
 		case "6":
-			protocol.Debug_Enable = !protocol.Debug_Enable
-			fmt.Printf("🔧 Mode debug : %v\n", protocol.Debug_Enable)
+			protocol.DebugEnabled = !protocol.DebugEnabled
+			fmt.Printf("ℹ️️ Mode debug : %v\n", protocol.DebugEnabled)
+		case "7":
+			if protocol.DebugEnabled {
+				pName := m.ask("Nom du peer cible : ")
+				m.connectToPeer(pName)
+			}
 		case "0", "q":
 			m.server.Stop()
 			return
 		default:
-			fmt.Println("❌ Choix invalide")
+			fmt.Println("⚠️ Choix invalide")
 		}
 	}
 }
 
 // 1. Lister les peers
-func (m *InteractiveMenu) listDirectoryPeers(print_or_other, disk_cache bool, ctx context.Context) {
+func (m *InteractiveMenu) listDirectoryPeers(browseMode, diskCache bool, ctx context.Context) {
 	fmt.Println("Récupération liste...")
 	peers, err := transport.GetListPeers()
 	if err != nil {
@@ -101,7 +110,7 @@ func (m *InteractiveMenu) listDirectoryPeers(print_or_other, disk_cache bool, ct
 		fmt.Printf(" [%d] %s\n", i+1, p)
 	}
 
-	if !print_or_other {
+	if !browseMode {
 		m.waitKey()
 		return
 	}
@@ -123,116 +132,12 @@ func (m *InteractiveMenu) listDirectoryPeers(print_or_other, disk_cache bool, ct
 		pInfo, _ = m.server.Manager.Get(pName)
 	}
 
-	if disk_cache {
+	if diskCache {
 		m.downloadManual(pName, pInfo, ctx)
 	} else {
 		m.explorePeer(pName, pInfo)
 	}
 
-}
-
-// Se connecter à un pair (Direct + NAT Traversal)
-func (m *InteractiveMenu) connectToPeer(pName string) {
-	_, ok := m.server.Manager.Get(pName)
-	if ok {
-		return // Déjà connecté
-	}
-
-	// Récup ip, parser et filtrer
-	listAddr, err := transport.GetAddr(pName)
-	if err != nil {
-		fmt.Printf("Impossible de récupérer les adresses de %s: %v\n", pName, err)
-		return
-	}
-	targets := utils.AddrParserSolver(listAddr)
-	if len(targets) == 0 {
-		fmt.Println("Pas d'adresses valides trouvées.")
-		return
-	}
-	targets = m.filterAddressesByProtocol(targets)
-	if len(targets) == 0 {
-		fmt.Println("Aucune adresse compatible avec nos protocols IP.")
-		return
-	}
-
-	fmt.Println("Tentative de connexion...")
-	// Phase 1: Tentatives de connexion directe
-	m.sendDirectConnection(targets, pName, 1)
-
-	// Vérifier quels protocoles ont réussi
-	targetIPv4, targetIPv6 := utils.SeperateAddressesByProtocol(targets)
-	var remainingTargets []*net.UDPAddr
-
-	peerInfo, exists := m.server.Manager.Get(pName)
-	if exists {
-		// Vérifier quels protocoles manquent
-		hasIPv4, hasIPv6 := false, false
-		for _, addrInfo := range peerInfo.Addrs {
-			if addrInfo.Addr.IP.To4() != nil {
-				hasIPv4 = true
-			} else {
-				hasIPv6 = true
-			}
-		}
-
-		// Garder uniquement les protocoles qui ont échoué
-		if !hasIPv4 {
-			remainingTargets = append(remainingTargets, targetIPv4...)
-		}
-		if !hasIPv6 {
-			remainingTargets = append(remainingTargets, targetIPv6...)
-		}
-	} else {
-		// Aucun protocole n'a réussi
-		remainingTargets = targets
-	}
-
-	// Phase 2: NAT traversal pour les protocoles qui ont échoué
-	if len(remainingTargets) > 0 {
-		choixRelais := ""
-		if protocol.Debug_Enable {
-			fmt.Println("\n--- Choix du relais pour NAT traversal ---")
-			fmt.Println("Appuyez sur Entrée (ou tapez 'default') pour utiliser le serveur central")
-			fmt.Println("Ou entrez le nom d'un peer connecté pour l'utiliser comme relais")
-			choixRelais = m.ask("Relais : ")
-			choixRelais = strings.TrimSpace(choixRelais)
-		}
-
-		// Configurer les canaux de réception pour chaque adresse restante
-		responseChan := make(chan *net.UDPAddr, max(len(remainingTargets)*2, 10))
-		m.server.PingResponseMu.Lock()
-		for _, target := range remainingTargets {
-			m.server.PingResponseChans[target.String()] = responseChan
-		}
-		m.server.PingResponseMu.Unlock()
-
-		if choixRelais == "" || choixRelais == "default" {
-			choixRelais = "jch.irif.fr"
-		}
-		fmt.Printf("--- Tentative NAT traversal via %s... ---\n", choixRelais)
-		natPerce := m.sendNatTraversalViaPeer(remainingTargets, choixRelais, responseChan)
-
-		// Cleanup des canaux
-		m.server.PingResponseMu.Lock()
-		for _, target := range remainingTargets {
-			delete(m.server.PingResponseChans, target.String())
-		}
-		m.server.PingResponseMu.Unlock()
-
-		// Si le NAT est percé, tenter la connexion avec Hello sur les adresses qui ont fonctionné
-		if natPerce {
-			m.sendDirectConnection(remainingTargets, pName, 1)
-		}
-	}
-
-	// Vérifier le résultat final
-	peerInfo, exists = m.server.Manager.Get(pName)
-	if exists {
-		fmt.Printf("✅ SUCCÈS : Connecté à %s avec %d adresse(s) !\n", pName, len(peerInfo.Addrs))
-	} else {
-		fmt.Println("❌ ÉCHEC : Impossible de joindre le peer.")
-	}
-	// m.waitKey()
 }
 
 // 2. Explorer
@@ -247,44 +152,9 @@ func (m *InteractiveMenu) explorePeer(pName string, pInfo *peer.PeerInfo) {
 	fmt.Println("  Entrez un chemin (ex: dir/subdir, ./pictures) pour naviguer par nom")
 	input := m.ask("Cible : ")
 
-	var targetHash [32]byte
-
-	input = strings.TrimSpace(input)
-	peerAddr := pInfo.GetAddr()
-
-	if input == "" {
-		// Mode par défaut : récupérer le root hash du peer
-		targetHash = m.getRootHashFromPeer(pInfo, pName)
-		if targetHash == ([32]byte{}) {
-			return
-		}
-	} else if looksLikeHash(input) {
-		// Mode hash : on explore directement depuis ce hash
-		parsedHash, err := utils.ParseHash(input)
-		if err != nil {
-			fmt.Printf("❌ Hash invalide : %v\n", err)
-			return
-		}
-		targetHash = parsedHash
-	} else {
-		// Résolution lazy (fetch datum par datum le long du chemin)
-		rootHash := m.getRootHashFromPeer(pInfo, pName)
-		if rootHash == ([32]byte{}) {
-			return
-		}
-
-		fmt.Printf("🔍 Résolution du chemin '%s'...\n", input)
-		fetcher := func(hash [32]byte) ([]byte, error) {
-			return m.server.FetchDatum(peerAddr, hash, 3*time.Second)
-		}
-		resolved, err := utils.ResolvePathLazy(fetcher, rootHash, input)
-		if err != nil {
-			fmt.Printf("❌ Chemin introuvable : %v\n", err)
-			m.waitKey()
-			return
-		}
-		fmt.Printf("✅ Chemin résolu : %s -> %x\n", input, resolved)
-		targetHash = resolved
+	targetHash, ok := m.resolveTarget(input, pInfo, pName)
+	if !ok {
+		return
 	}
 
 	// Extraire le nom d'affichage depuis le chemin (dernier composant)
@@ -299,12 +169,12 @@ func (m *InteractiveMenu) explorePeer(pName string, pInfo *peer.PeerInfo) {
 	}
 
 	// On télécharge l'arborescence depuis le hash cible
-	fmt.Println("\n📥 Téléchargement de l'arborescence en cours...")
-	dl := transport.NewDownloader(m.server, peerAddr)
+	fmt.Println("\nℹ️ Téléchargement de l'arborescence en cours...")
+	dl := transport.NewDownloader(m.server, pInfo.GetAddr())
 	dl.DownloadTree(targetHash)
 
 	fmt.Println("\n--- ARBORESCENCE DISTANTE ---")
-	utils.PrintTree(m.server.Downloads, targetHash, "", displayName, true)
+	merkle.PrintTree(m.server.Downloads, targetHash, "", displayName, true)
 	m.waitKey()
 }
 
@@ -320,52 +190,18 @@ func (m *InteractiveMenu) downloadManual(pName string, pInfo *peer.PeerInfo, ctx
 	fmt.Println("  Entrez un chemin (ex: dir/subdir, ./pictures) pour naviguer par nom")
 	input := m.ask("Cible : ")
 
-	var targetHash [32]byte
-	input = strings.TrimSpace(input)
-	peerAddr := pInfo.GetAddr()
-
-	if input == "" {
-		// Mode par défaut : récupérer le root hash du peer
-		targetHash = m.getRootHashFromPeer(pInfo, pName)
-		if targetHash == ([32]byte{}) {
-			return
-		}
-	} else if looksLikeHash(input) {
-		// Mode hash : on télécharge directement depuis ce hash
-		parsedHash, err := utils.ParseHash(input)
-		if err != nil {
-			fmt.Printf("❌ Hash invalide : %v\n", err)
-			return
-		}
-		targetHash = parsedHash
-	} else {
-		// Résolution lazy (fetch datum par datum le long du chemin)
-		rootHash := m.getRootHashFromPeer(pInfo, pName)
-		if rootHash == ([32]byte{}) {
-			return
-		}
-
-		fmt.Printf("🔍 Résolution du chemin '%s'...\n", input)
-		fetcher := func(hash [32]byte) ([]byte, error) {
-			return m.server.FetchDatum(peerAddr, hash, 3*time.Second)
-		}
-		resolved, err := utils.ResolvePathLazy(fetcher, rootHash, input)
-		if err != nil {
-			fmt.Printf("❌ Chemin introuvable : %v\n", err)
-			m.waitKey()
-			return
-		}
-		fmt.Printf("✅ Chemin résolu : %s -> %x\n", input, resolved)
-		targetHash = resolved
+	targetHash, ok := m.resolveTarget(input, pInfo, pName)
+	if !ok {
+		return
 	}
 
 	// Gestion Ctrl+C
-	dlCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	dlCtx, cancel := context.WithTimeout(ctx, config.GlobalConfig.Network.DownloadTimeout)
 	defer cancel()
 
 	destDir := filepath.Join("downloads", utils.CleanName(pName))
-	fmt.Printf("📂 Destination: %s\n", destDir)
-	diskDownloader := transport.NewDiskDownloader(m.server, peerAddr, destDir)
+	fmt.Printf("ℹ️️ Destination: %s\n", destDir)
+	diskDownloader := transport.NewDiskDownloader(m.server, pInfo.GetAddr(), destDir)
 	if err := diskDownloader.DownloadToDisk(dlCtx, targetHash); err != nil {
 		fmt.Printf("❌ Erreur lors du téléchargement: %v\n", err)
 	}
@@ -376,7 +212,7 @@ func (m *InteractiveMenu) downloadManual(pName string, pInfo *peer.PeerInfo, ctx
 func (m *InteractiveMenu) showConnections() {
 	connectedPeers := m.server.Manager.List()
 
-	fmt.Println("\n🔗 Peers connectés:")
+	fmt.Println("\nℹ️️ Peers connectés:")
 
 	if len(connectedPeers) == 0 {
 		fmt.Println("	Aucun peer connecté")
@@ -389,9 +225,9 @@ func (m *InteractiveMenu) showConnections() {
 			}
 			fmt.Printf("    Dernière activité: %s\n", info.LastSeen.Format("15:04:05"))
 			if info.IsRelay {
-				fmt.Println("    🔄 Peut être utilisé comme relais NAT traversal")
+				fmt.Println("    ℹ️️ Peut être utilisé comme relais NAT traversal")
 			} else {
-				fmt.Println("    ❌ Ne peut pas être utilisé comme relais NAT traversal")
+				fmt.Println("    ⚠️ Ne peut pas être utilisé comme relais NAT traversal")
 			}
 		}
 	}
@@ -401,16 +237,16 @@ func (m *InteractiveMenu) showConnections() {
 // 5. Affichage des fichiers locaux
 func (m *InteractiveMenu) showLocalFiles() {
 	if m.server.RootHash == [32]byte{} {
-		fmt.Println("\n📁 Aucun fichier partagé")
+		fmt.Println("\nℹ️️ Aucun fichier partagé")
 		return
 	}
 
-	fmt.Println("\n📁 Mes fichiers partagés:")
+	fmt.Println("\nℹ️️ Mes fichiers partagés:")
 	fmt.Printf("  Hash racine: %x\n", m.server.RootHash)
 	fmt.Printf("  Datums dans le store: %d\n", m.server.MerkleStore.Len())
 
 	fmt.Println("\n  Arborescence:")
-	utils.PrintTree(m.server.MerkleStore, m.server.RootHash, "  ", "", true)
+	merkle.PrintTree(m.server.MerkleStore, m.server.RootHash, "  ", "", true)
 
 	m.waitKey()
 }
@@ -429,207 +265,70 @@ func (m *InteractiveMenu) waitKey() {
 	m.scanner.Scan()
 }
 
-// Envoie des Hello pour tenter une connexion directe
-func (m *InteractiveMenu) sendDirectConnection(addresses []*net.UDPAddr, pName string, maxAttempts int) bool {
-	startTime := time.Now()
-
-	for range maxAttempts {
-		for _, addr := range addresses {
-			transport.SendHello(m.server.Conn, addr, m.server.MyName, m.server.PrivKey)
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	// Vérifier si le peer existe et a été vu récemment
-	if peerInfo, exists := m.server.Manager.Get(pName); exists {
-		if peerInfo.LastSeen.After(startTime) {
-			return true
-		}
-	}
-	return false
-}
-
-// sendNatTraversalViaPeer utilise un pair comme relais pour le NAT traversal
-func (m *InteractiveMenu) sendNatTraversalViaPeer(targetAddresses []*net.UDPAddr, relayPeerName string, responseChan chan *net.UDPAddr) bool {
-	// Vérifier que le peer relais est connecté
-	relayPeer, exists := m.server.Manager.Get(relayPeerName)
-	if !exists {
-		fmt.Printf("❌ Peer relais %s non connecté. Vous devez d'abord être connecté avec ce peer.\n", relayPeerName)
-		return false
-	}
-	// Vérifier que le peer relais est configuré comme relais NAT
-	if !relayPeer.IsRelay {
-		fmt.Printf("❌ Peer relais %s n'est pas configuré comme relais NAT.\n", relayPeerName)
-		return false
-	}
-	fmt.Printf("🚀 Utilisation de %s comme relais (%d adresse(s))\n", relayPeerName, len(relayPeer.Addrs))
-
-	// Filtrer les adresses en fonction de nos protocols
-	filteredTargets := m.filterAddressesByProtocol(targetAddresses)
-	if len(filteredTargets) == 0 {
-		fmt.Println("❌ Aucune adresse cible compatible avec nos protocols IP.")
-		return false
-	}
-
-	targetIPv4, targetIPv6 := utils.SeperateAddressesByProtocol(filteredTargets)
-	relayAddrs := make([]*net.UDPAddr, 0, len(relayPeer.Addrs))
-	for _, addrInfo := range relayPeer.Addrs {
-		relayAddrs = append(relayAddrs, addrInfo.Addr)
-	}
-	relayIPv4, relayIPv6 := utils.SeperateAddressesByProtocol(relayAddrs)
-
-	var succes6, succes4 bool
-
-	// Essayer IPv6 d'abord si disponible
-	if len(targetIPv6) > 0 && len(relayIPv6) > 0 {
-		fmt.Println("🔄 Tentative via IPv6...")
-		for _, targetAddr := range targetIPv6 {
-			transport.SendNatTraversalRequest(m.server.Conn, relayIPv6[0], targetAddr, m.server.PrivKey)
-		}
-
-		if m.pingSpam(targetIPv6, 3, responseChan) {
-			fmt.Println("✅ NAT traversal réussi via IPv6")
-			succes6 = true
-		}
-		// fmt.Println("⚠️ IPv6 a échoué, tentative via IPv4...")
-	}
-	// Essayer IPv4 si IPv6 a échoué ou n'était pas disponible
-	if len(targetIPv4) > 0 && len(relayIPv4) > 0 {
-		fmt.Println("🔄 Tentative via IPv4...")
-		for _, targetAddr := range targetIPv4 {
-			transport.SendNatTraversalRequest(m.server.Conn, relayIPv4[0], targetAddr, m.server.PrivKey)
-		}
-
-		if m.pingSpam(targetIPv4, 3, responseChan) {
-			fmt.Println("✅ NAT traversal réussi via IPv4")
-			succes4 = true
-		}
-		// fmt.Println("❌ Échec du NAT traversal via IPv4.")
-	}
-	if succes4 || succes6 {
-		return true
-	}
-	fmt.Println("❌ Échec du NAT traversal via toutes les adresses.")
-	return false
-}
-
-// pingSpam envoie plusieurs pings pour percer le NAT avec backoff exponentiel
-// Retourne true dès réception d'un ping du pair ou d'un OK en réponse
-func (m *InteractiveMenu) pingSpam(addresses []*net.UDPAddr, count int, responseChan chan *net.UDPAddr) bool {
-	// Créer une map des adresses cibles pour vérification rapide
-	targetAddrs := make(map[string]bool)
-	for _, addr := range addresses {
-		targetAddrs[addr.String()] = true
-	}
-
-	// Calculer le timeout total basé sur le backoff exponentiel
-	totalTimeout := utils.CalExpo2Time(count)
-
-	// Démarrer la surveillance
-	pierced := make(chan bool, 1)
-	go func() {
-		timeout := time.After(totalTimeout)
-		for {
-			select {
-			case receivedAddr := <-responseChan:
-				if targetAddrs[receivedAddr.String()] {
-					pierced <- true
-					return
-				}
-			case <-timeout:
-				pierced <- false
-				return
-			}
-		}
-	}()
-
-	// Envoyer les pings avec backoff exponentiel
-	for i := range count {
-		// Envoyer ping à toutes les adresses
-		for _, addr := range addresses {
-			transport.SendPing(m.server.Conn, addr)
-		}
-
-		// Vérifier si on a reçu une réponse
-		select {
-		case result := <-pierced:
-			return result
-		default:
-		}
-
-		// Attendre avec backoff exponentiel (sauf après le dernier envoi)
-		if i < count-1 {
-			waitTime := time.Second
-			if i > 0 {
-				waitTime = time.Duration(1<<uint(i)) * time.Second
-			}
-
-			select {
-			case result := <-pierced:
-				return result
-			case <-time.After(waitTime):
-			}
-		}
-	}
-
-	// Attendre le résultat final
-	select {
-	case result := <-pierced:
-		return result
-	case <-time.After(500 * time.Millisecond):
-		return false
-	}
-}
-
-// Helper pour obtenir le hash racine depuis un peer
-func (m *InteractiveMenu) getRootHashFromPeer(pInfo *peer.PeerInfo, pName string) [32]byte {
-	fmt.Printf("🔍 Demande du hash racine à %s...\n", pName)
-	m.rootHashChan = make(chan [32]byte, 1)
-	m.server.SetRootHashChan(m.rootHashChan)
+// resolveTarget résout une cible (vide=root, hash hex, ou chemin) vers un hash Merkle.
+// Retourne le hash et true si succès, ou [32]byte{} et false si erreur.
+func (m *InteractiveMenu) resolveTarget(input string, pInfo *peer.PeerInfo, pName string) ([32]byte, bool) {
+	input = strings.TrimSpace(input)
 	peerAddr := pInfo.GetAddr()
-	m.server.RegisterRootRequest(peerAddr)
+
+	if input == "" {
+		hash := m.getRootHashFromPeer(pInfo, pName)
+		return hash, hash != [32]byte{}
+	}
+
+	if looksLikeHash(input) {
+		parsed, err := utils.ParseHash(input)
+		if err != nil {
+			fmt.Printf("⚠️ Hash invalide : %v\n", err)
+			return [32]byte{}, false
+		}
+		return parsed, true
+	}
+
+	// Résolution lazy par chemin
+	rootHash := m.getRootHashFromPeer(pInfo, pName)
+	if rootHash == ([32]byte{}) {
+		return [32]byte{}, false
+	}
+
+	fmt.Printf("ℹ️️ Résolution du chemin '%s'...\n", input)
+	fetcher := func(hash [32]byte) ([]byte, error) {
+		return m.server.FetchDatum(peerAddr, hash, config.GlobalConfig.Network.ResolveDatumTimeout)
+	}
+	resolved, err := merkle.ResolvePathLazy(fetcher, rootHash, input)
+	if err != nil {
+		fmt.Printf("⚠️ Chemin introuvable : %v\n", err)
+		m.waitKey()
+		return [32]byte{}, false
+	}
+	fmt.Printf("✅ Chemin résolu : %s -> %x\n", input, resolved)
+	return resolved, true
+}
+
+// getRootHashFromPeer demande et attend le hash racine depuis un peer
+func (m *InteractiveMenu) getRootHashFromPeer(pInfo *peer.PeerInfo, pName string) [32]byte {
+	fmt.Printf("ℹ️️ Demande du hash racine à %s...\n", pName)
+	rootHashChan := make(chan [32]byte, 1)
+	m.server.SetRootHashChan(rootHashChan)
+	peerAddr := pInfo.GetAddr()
+	m.server.Pending.RegisterRoot(peerAddr)
 	transport.SendRootRequest(m.server.Conn, peerAddr)
 
-	fmt.Println("⌛ En attente de la réponse...")
+	fmt.Println("ℹ️️ En attente de la réponse...")
 
 	var targetHash [32]byte
 	select {
-	case tmpHash := <-m.rootHashChan:
+	case tmpHash := <-rootHashChan:
 		fmt.Println("✅ Réception du hash racine réussie")
 		targetHash = tmpHash
-		m.server.UnregisterRootRequest(peerAddr)
-	case <-time.After(3 * time.Second):
-		fmt.Println("⏳ Timeout: pas de réponse reçue (3s)")
-		m.server.UnregisterRootRequest(peerAddr)
+		m.server.Pending.UnregisterRoot(peerAddr)
+	case <-time.After(config.GlobalConfig.Network.RootReplyTimeout):
+		fmt.Printf("⚠️ Timeout: pas de réponse reçue (%v)\n", config.GlobalConfig.Network.RootReplyTimeout)
+		m.server.Pending.UnregisterRoot(peerAddr)
 	}
 
 	m.server.SetRootHashChan(nil)
 	return targetHash
-}
-
-// filterAddressesByProtocol filtre les adresses en fonction des protocols locales
-func (m *InteractiveMenu) filterAddressesByProtocol(addresses []*net.UDPAddr) []*net.UDPAddr {
-	if !m.hasIPv4 && !m.hasIPv6 {
-		fmt.Println("⚠️ Aucun protocole IP disponible !")
-		return nil
-	}
-
-	var filtered []*net.UDPAddr
-	for _, addr := range addresses {
-		isIPv4 := addr.IP.To4() != nil
-
-		if isIPv4 && m.hasIPv4 {
-			filtered = append(filtered, addr)
-		} else if !isIPv4 && m.hasIPv6 {
-			filtered = append(filtered, addr)
-		}
-	}
-
-	if len(filtered) == 0 {
-		fmt.Println("⚠️ Aucune adresse compatible avec nos protocols IP")
-	}
-
-	return filtered
 }
 
 // looksLikeHash vérifie si une chaîne ressemble à un hash hexadécimal (au moins 16 chars hex)
@@ -638,10 +337,6 @@ func looksLikeHash(s string) bool {
 	if len(s) < 16 {
 		return false
 	}
-	for _, c := range s {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-			return false
-		}
-	}
-	return true
+	_, err := hex.DecodeString(s)
+	return err == nil
 }

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"main/internal/config"
 	"os"
 	"path/filepath"
 )
@@ -14,13 +15,32 @@ const (
 	TypeBig          = 2 // Fichier fragmenté
 	TypeBigDirectory = 3 // Répertoire fragmenté
 
-	MaxChunkSize   = 1024
-	MaxDirEntries  = 16
-	MaxBigChildren = 32
-	FileNameSize   = 32
-	HashSize       = 32
-	DirEntrySize   = FileNameSize + HashSize // Taille d'une entrée de répertoire (32 nom + 32 hash)
+	FileNameSize = 32
+	HashSize     = 32
+	DirEntrySize = FileNameSize + HashSize // Taille d'une entrée de répertoire (32 nom + 32 hash)
 )
+
+// Valeurs paramétrables depuis la config (remplace les anciennes constantes)
+func GetMaxChunkSize() int {
+	if config.GlobalConfig != nil {
+		return config.GlobalConfig.Merkle.MaxChunkSize
+	}
+	return 1024
+}
+
+func GetMaxDirEntries() int {
+	if config.GlobalConfig != nil {
+		return config.GlobalConfig.Merkle.MaxDirEntries
+	}
+	return 16
+}
+
+func GetMaxBigChildren() int {
+	if config.GlobalConfig != nil {
+		return config.GlobalConfig.Merkle.MaxBigChildren
+	}
+	return 32
+}
 
 // DirEntry: une ligne dans un répertoire
 type DirEntry struct {
@@ -32,8 +52,8 @@ type DirEntry struct {
 
 // CreateChunk : [Type 0] [Data...]
 func CreateChunk(data []byte) ([]byte, [32]byte) {
-	if len(data) > MaxChunkSize {
-		panic(fmt.Sprintf("❌ La taille du chunk dépasse %d octets", MaxChunkSize))
+	if len(data) > GetMaxChunkSize() {
+		panic(fmt.Sprintf("❌ La taille du chunk dépasse %d octets", GetMaxChunkSize()))
 	}
 	datum := make([]byte, 1+len(data))
 	datum[0] = TypeChunk
@@ -43,8 +63,8 @@ func CreateChunk(data []byte) ([]byte, [32]byte) {
 
 // CreateDirectoryNode : [Type 1] [Entry1] [Entry2] ...
 func CreateDirectoryNode(entries []DirEntry) ([]byte, [32]byte) {
-	if len(entries) > MaxDirEntries {
-		panic(fmt.Sprintf("❌ Directory ne peut pas avoir plus de %d entrées, a %d", MaxDirEntries, len(entries)))
+	if len(entries) > GetMaxDirEntries() {
+		panic(fmt.Sprintf("❌ Directory ne peut pas avoir plus de %d entrées, a %d", GetMaxDirEntries(), len(entries)))
 	}
 	datum := make([]byte, 1+len(entries)*DirEntrySize)
 	datum[0] = TypeDirectory
@@ -58,7 +78,7 @@ func CreateDirectoryNode(entries []DirEntry) ([]byte, [32]byte) {
 
 // CreateBigNode (pour Type 2 et 3) : [Type X] [Hash1] [Hash2] ...
 func CreateBigNode(nodeType uint8, hashes [][32]byte) ([]byte, [32]byte) {
-	if len(hashes) > MaxBigChildren {
+	if len(hashes) > GetMaxBigChildren() {
 		panic(fmt.Sprintf("❌ Trop d'enfant pour un noeud,  %d", len(hashes)))
 	}
 	datum := make([]byte, 1+len(hashes)*HashSize)
@@ -77,13 +97,13 @@ func FileToMerkle(store *Store, filePath string) ([32]byte, error) {
 	defer file.Close()
 
 	var chunkHashes [][32]byte
-	buffer := make([]byte, MaxChunkSize)
+	buffer := make([]byte, GetMaxChunkSize())
 
 	for {
 		n, err := file.Read(buffer)
 		if n > 0 {
-			datum, _ := CreateChunk(buffer[:n])
-			hash := store.Add(datum)
+			datum, hash := CreateChunk(buffer[:n])
+			store.Set(hash, datum)
 			chunkHashes = append(chunkHashes, hash)
 		}
 		if err == io.EOF {
@@ -96,8 +116,8 @@ func FileToMerkle(store *Store, filePath string) ([32]byte, error) {
 
 	// Cas vide
 	if len(chunkHashes) == 0 {
-		datum, _ := CreateChunk([]byte{})
-		hash := store.Add(datum)
+		datum, hash := CreateChunk([]byte{})
+		store.Set(hash, datum)
 		return hash, nil
 	}
 	return buildRecursive(store, chunkHashes, TypeBig), nil
@@ -135,12 +155,12 @@ func DirToMerkle(store *Store, dirPath string) ([32]byte, error) {
 		}
 	}
 
-	// 	Découpage en blocs de MaxDirEntries
+	// 	Découpage en blocs de GetMaxDirEntries()
 	var childHashes [][32]byte
-	for i := 0; i < len(dirEntries); i += MaxDirEntries {
-		end := min(i+MaxDirEntries, len(dirEntries))
-		datum, _ := CreateDirectoryNode(dirEntries[i:end])
-		hash := store.Add(datum)
+	for i := 0; i < len(dirEntries); i += GetMaxDirEntries() {
+		end := min(i+GetMaxDirEntries(), len(dirEntries))
+		datum, hash := CreateDirectoryNode(dirEntries[i:end])
+		store.Set(hash, datum)
 		childHashes = append(childHashes, hash)
 	}
 	return buildRecursive(store, childHashes, TypeBigDirectory), nil
@@ -157,16 +177,16 @@ func buildRecursive(store *Store, hashes [][32]byte, nodeType uint8) [32]byte {
 
 	var parentHashes [][32]byte
 
-	for i := 0; i < len(hashes); i += MaxBigChildren {
-		end := min(i+MaxBigChildren, len(hashes))
+	for i := 0; i < len(hashes); i += GetMaxBigChildren() {
+		end := min(i+GetMaxBigChildren(), len(hashes))
 
 		group := hashes[i:end]
 		if len(group) == 1 && len(hashes) == 1 {
 			return group[0]
 		}
 
-		datum, _ := CreateBigNode(nodeType, group)
-		hash := store.Add(datum)
+		datum, hash := CreateBigNode(nodeType, group)
+		store.Set(hash, datum)
 		parentHashes = append(parentHashes, hash)
 	}
 

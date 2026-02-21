@@ -15,13 +15,24 @@ import (
 )
 
 // Client global avec un timeout pour ne pas freezer l'app si l'annuaire est down
-var httpClient = &http.Client{
-	Timeout: 5 * time.Second,
-	Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true, // Ignore la vérification des certificats SSL
-		},
-	},
+var httpClient *http.Client
+
+func getHTTPClient() *http.Client {
+	if httpClient == nil {
+		timeout := 5 * time.Second
+		if config.GlobalConfig != nil {
+			timeout = config.GlobalConfig.Network.HTTPClientTimeout
+		}
+		httpClient = &http.Client{
+			Timeout: timeout,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true, // Ignore la vérification des certificats SSL
+				},
+			},
+		}
+	}
+	return httpClient
 }
 
 // GetListPeers récupère la liste des noms enregistrés
@@ -50,7 +61,7 @@ func GetListPeers() ([]string, error) {
 
 // httpGetWithTimeout effectue une requête GET avec timeout et gestion d'erreur
 func httpGetWithTimeout(url string) ([]byte, int, error) {
-	resp, err := httpClient.Get(url)
+	resp, err := getHTTPClient().Get(url)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -105,7 +116,7 @@ func RegisterHTTP(privKey *ecdsa.PrivateKey) error {
 	req.Header.Set("Content-Type", "application/octet-stream")
 
 	// 3. Envoi
-	resp, err := httpClient.Do(req)
+	resp, err := getHTTPClient().Do(req)
 	if err != nil {
 		return err
 	}

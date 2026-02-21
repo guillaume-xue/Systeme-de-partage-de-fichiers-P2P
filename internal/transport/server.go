@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"fmt"
+	"main/internal/config"
 	"main/internal/merkle"
 	"main/internal/peer"
 	"main/internal/protocol"
@@ -34,15 +35,10 @@ type Server struct {
 	PingResponseMu    sync.Mutex
 
 	// Sécurité : suivi des requêtes en attente (anti-injection)
-	// Hash → set d'adresses de peers à qui on a demandé ce datum
-	PendingDatumRequests map[[32]byte]map[string]struct{}
-	PendingDatumMu       sync.RWMutex
-	PendingRootRequests  map[string]struct{} // Adresses à qui on a envoyé un RootRequest
-	PendingRootRequestMu sync.Mutex
+	Pending *PendingTracker
 
 	// Cache HTTP pour éviter de spammer l'annuaire
-	keyCache   map[string][]byte
-	keyCacheMu sync.RWMutex
+	keyCache *KeyCache
 
 	workerSem chan struct{}
 	workerWg  sync.WaitGroup
@@ -52,25 +48,24 @@ type Server struct {
 
 func NewServer(conn *net.UDPConn, key *ecdsa.PrivateKey, name string) *Server {
 	return &Server{
-		Conn:                 conn,
-		PrivKey:              key,
-		MyName:               name,
-		Manager:              peer.NewManager(),
-		MerkleStore:          merkle.NewStore(),
-		Downloads:            merkle.NewStore(),
-		DatumDispatcher:      NewDatumDispatcher(),
-		keyCache:             make(map[string][]byte),
-		PingResponseChans:    make(map[string]chan *net.UDPAddr),
-		PendingDatumRequests: make(map[[32]byte]map[string]struct{}),
-		PendingRootRequests:  make(map[string]struct{}),
-		workerSem:            make(chan struct{}, 100), // Limite à 100 workers concurrents
-		shutdown:             make(chan struct{}),
+		Conn:              conn,
+		PrivKey:           key,
+		MyName:            name,
+		Manager:           peer.NewManager(),
+		MerkleStore:       merkle.NewStore(),
+		Downloads:         merkle.NewStore(),
+		DatumDispatcher:   NewDatumDispatcher(),
+		keyCache:          NewKeyCache(),
+		PingResponseChans: make(map[string]chan *net.UDPAddr),
+		Pending:           NewPendingTracker(),
+		workerSem:         make(chan struct{}, config.GlobalConfig.Network.MaxPacketWorkers), // Limite les workers concurrents
+		shutdown:          make(chan struct{}),
 	}
 }
 
 // ListenLoop : Boucle principale
 func (s *Server) ListenLoop(ctx context.Context) {
-	buf := make([]byte, 65535) // max buffer
+	buf := make([]byte, config.GlobalConfig.Network.UDPReadBufferSize) // max buffer
 
 	for {
 		n, remote, err := s.Conn.ReadFromUDP(buf)
@@ -97,7 +92,7 @@ func (s *Server) ListenLoop(ctx context.Context) {
 				}()
 				s.handlePacket(remote, packetData)
 			}()
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(time.Duration(config.GlobalConfig.Network.WorkerOverflowTimeoutMs) * time.Millisecond):
 			// Trop de workers, on drop le packet
 		case <-ctx.Done():
 			return
@@ -125,7 +120,7 @@ func (s *Server) FetchDatum(peerAddr *net.UDPAddr, hash [32]byte, timeout time.D
 
 	// S'abonner au dispatcher pour capter la réponse
 	received := make(chan []byte, 1)
-	unsubscribe := s.DatumDispatcher.Subscribe("fetch_single", func(h [32]byte, data []byte) {
+	unsubscribe := s.DatumDispatcher.Subscribe(func(h [32]byte, data []byte) {
 		if h == hash {
 			select {
 			case received <- data:
@@ -136,9 +131,9 @@ func (s *Server) FetchDatum(peerAddr *net.UDPAddr, hash [32]byte, timeout time.D
 	defer unsubscribe()
 
 	// Envoyer la requête (avec retry)
-	maxRetries := 3
+	maxRetries := config.GlobalConfig.Network.FetchMaxRetries
 	for attempt := range maxRetries {
-		s.RegisterDatumRequest(hash, peerAddr)
+		s.Pending.RegisterDatum(hash, peerAddr)
 		SendDatumRequest(s.Conn, peerAddr, hash)
 
 		retryTimeout := timeout
@@ -148,14 +143,14 @@ func (s *Server) FetchDatum(peerAddr *net.UDPAddr, hash [32]byte, timeout time.D
 
 		select {
 		case data := <-received:
-			s.UnregisterDatumRequest(hash, peerAddr)
+			s.Pending.UnregisterDatum(hash, peerAddr)
 			// Vérifier aussi dans le store (le handler l'a peut-être déjà stocké)
 			if datum, ok := s.Downloads.Get(hash); ok {
 				return datum, nil
 			}
 			return data, nil
 		case <-time.After(retryTimeout):
-			s.UnregisterDatumRequest(hash, peerAddr)
+			s.Pending.UnregisterDatum(hash, peerAddr)
 			if attempt < maxRetries-1 {
 				continue
 			}

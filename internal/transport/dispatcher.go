@@ -18,10 +18,9 @@ func NewDatumDispatcher() *DatumDispatcher {
 	}
 }
 
-// Subscribe ajoute un écouteur
-// name est là pour le debug, on ne s'en sert pas pour la logique interne
+// Subscribe ajoute un écouteur.
 // Retourne une fonction "unsubscribe" à appeler pour nettoyer
-func (d *DatumDispatcher) Subscribe(name string, handler DatumHandler) func() {
+func (d *DatumDispatcher) Subscribe(handler DatumHandler) func() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 

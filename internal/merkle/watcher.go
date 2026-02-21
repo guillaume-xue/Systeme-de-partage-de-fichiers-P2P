@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -12,16 +13,16 @@ import (
 // basée sur les noms, tailles et dates de modification des fichiers.
 // Cela permet de détecter les changements sans reconstruire tout le Merkle tree.
 func computeDirFingerprint(dirPath string) (string, error) {
-	var fingerprint string
+	var sb strings.Builder
 	err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil // Ignorer les fichiers inaccessibles
 		}
 		rel, _ := filepath.Rel(dirPath, path)
-		fingerprint += fmt.Sprintf("%s|%d|%d;", rel, info.Size(), info.ModTime().UnixNano())
+		fmt.Fprintf(&sb, "%s|%d|%d;", rel, info.Size(), info.ModTime().UnixNano())
 		return nil
 	})
-	return fingerprint, err
+	return sb.String(), err
 }
 
 // OnRootChanged est le type de callback appelé quand le root hash change
@@ -61,7 +62,7 @@ func WatchSharedDir(ctx context.Context, sharedDir string, interval time.Duratio
 				continue
 			}
 
-			fmt.Printf("🔄 Changement détecté dans le dossier partagé, mise à jour du Merkle tree (root: %x...)\n", newRoot[:8])
+			fmt.Printf("ℹ️️ Changement détecté dans le dossier partagé, mise à jour du Merkle tree (root: %x...)\n", newRoot[:8])
 			onChange(newStore, newRoot)
 		}
 	}

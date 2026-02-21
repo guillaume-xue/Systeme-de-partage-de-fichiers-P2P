@@ -36,12 +36,12 @@ func main() {
 	select {
 	case sig := <-sigChan:
 		// Cas: CTRL+C
-		fmt.Printf("\n🛑 Signal reçu (%v), fermeture en cours...\n", sig)
+		fmt.Printf("\nℹ️️ Signal reçu (%v), fermeture en cours...\n", sig)
 		cancel() // On prévient run() qu'il faut arrêter via le contexte
 	case err := <-done:
 		// Cas: Le menu est quitté ou une erreur critique survient
 		if err != nil {
-			log.Fatal("❌ Erreur critique : %w\n", err)
+			log.Fatalf("❌ Erreur critique : %v\n", err)
 		}
 		fmt.Println("\n✅ Application terminée normalement.")
 	}
@@ -65,14 +65,14 @@ func run(ctx context.Context) error {
 
 	// Enregistrement HTTP
 	if err := transport.RegisterHTTP(privKey); err != nil {
-		return fmt.Errorf("❌ Impossible de s'enregistrer: %w\n", err)
+		return fmt.Errorf("❌ Impossible de s'enregistrer: %w", err)
 	}
 	fmt.Println("✅ Clé publique enregistrée sur le serveur HTTP")
 
 	// Connexion UDP
 	conn, serverAddr, err := transport.TryConnectWithFallback(cfg.Peer.Name, privKey)
 	if err != nil {
-		return fmt.Errorf("❌ Impossible de se connecter au serveur UDP: %w\n", err)
+		return fmt.Errorf("❌ Impossible de se connecter au serveur UDP: %w", err)
 	}
 	defer conn.Close()
 	fmt.Printf("✅ Connecté au serveur UDP (%s) [Mode: %s]\n", serverAddr, transport.GetNetworkMode())
@@ -81,27 +81,26 @@ func run(ctx context.Context) error {
 	server := transport.NewServer(conn, privKey, cfg.Peer.Name)
 
 	// Charger le dossier partagé dans le Merkle tree ou la créer s'il n'existe pas
-	sharedDir := filepath.Join(".", "shared")
+	sharedDir := filepath.Join(".", cfg.Peer.SharedDir)
 	if _, err := os.Stat(sharedDir); os.IsNotExist(err) {
 		if err := os.Mkdir(sharedDir, 0755); err != nil {
-			return fmt.Errorf("❌ Impossible de créer le dossier partagé: %w\n", err)
+			return fmt.Errorf("❌ Impossible de créer le dossier partagé: %w", err)
 		}
 		fmt.Println("✅ Dossier partagé créé")
 	}
 	store := merkle.NewStore()
 	rootHash, err := merkle.DirToMerkle(store, sharedDir)
 	if err != nil {
-		return fmt.Errorf("❌ Impossible de charger le dossier partagé: %w\n", err)
-	} else {
-		server.SetMerkleRoot(store, rootHash)
-		fmt.Printf("✅ Dossier partagé chargé (root: %x...)\n", rootHash)
+		return fmt.Errorf("❌ Impossible de charger le dossier partagé: %w", err)
 	}
+	server.SetMerkleRoot(store, rootHash)
+	fmt.Printf("✅ Dossier partagé chargé (root: %x...)\n", rootHash)
 
 	// Surveillance automatique du dossier partagé
-	go merkle.WatchSharedDir(ctx, sharedDir, 5*time.Second, func(newStore *merkle.Store, newRoot [32]byte) {
+	go merkle.WatchSharedDir(ctx, sharedDir, cfg.Merkle.WatchInterval, func(newStore *merkle.Store, newRoot [32]byte) {
 		server.SetMerkleRoot(newStore, newRoot)
 	})
-	fmt.Println("✅ Surveillance du dossier partagé activée (intervalle: 5s)")
+	fmt.Printf("✅ Surveillance du dossier partagé activée (intervalle: %v)\n", cfg.Merkle.WatchInterval)
 
 	// Démarrage des services
 	// Routine d'écoute
@@ -109,10 +108,10 @@ func run(ctx context.Context) error {
 	fmt.Println("✅ Routine d'écoute UDP démarrée")
 
 	// Routine keep-alive
-	go server.KeepAlive(serverAddr, cfg.Network.KeepAlive, ctx)
+	go server.KeepAlive(ctx, serverAddr, cfg.Network.KeepAlive)
 	fmt.Printf("✅ Keep-alive activé (%v)\n", cfg.Network.KeepAlive)
 
-	time.Sleep(1 * time.Second) // Laisser le temps de tout initialiser avec les precedents requetes
+	time.Sleep(time.Duration(cfg.Network.StartupDelayMs) * time.Millisecond) // Laisser le temps de tout initialiser avec les precedents requetes
 
 	fmt.Println("\n✅ Client démarré!")
 	fmt.Printf("   Nom: %s\n", cfg.Peer.Name)

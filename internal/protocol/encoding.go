@@ -119,24 +119,24 @@ func (m *NatTraversalMessage) EncodeBody() []byte {
 	return m.Address.Encode()
 }
 
-// Encode construit le paquet final pour le réseau
-func (p *Packet) Encode() []byte {
-	head := p.Header.Encode()
-	buf := make([]byte, len(head)+len(p.Body)+len(p.Signature))
-	copy(buf[0:], head)
-	copy(buf[HeaderSize:], p.Body)
-	if len(p.Signature) > 0 {
-		copy(buf[HeaderSize+len(p.Body):], p.Signature)
-	}
-	return buf
-}
-
 // DataToSign retourne les données à signer (header + body)
 func (p *Packet) DataToSign() []byte {
 	head := p.Header.Encode()
-	buf := make([]byte, len(head)+len(p.Body))
+	buf := make([]byte, HeaderSize+len(p.Body))
 	copy(buf, head)
-	copy(buf[len(head):], p.Body)
+	copy(buf[HeaderSize:], p.Body)
+	return buf
+}
+
+// Encode construit le paquet final pour le réseau
+func (p *Packet) Encode() []byte {
+	data := p.DataToSign()
+	if len(p.Signature) == 0 {
+		return data
+	}
+	buf := make([]byte, len(data)+len(p.Signature))
+	copy(buf, data)
+	copy(buf[len(data):], p.Signature)
 	return buf
 }
 

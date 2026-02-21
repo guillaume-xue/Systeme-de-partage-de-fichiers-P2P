@@ -2,6 +2,7 @@ package peer
 
 import (
 	"crypto/ecdsa"
+	"main/internal/config"
 	"net"
 	"sync"
 	"time"
@@ -93,7 +94,7 @@ func (m *Manager) CleanExpired() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	timeout := 5 * time.Minute
+	timeout := config.GlobalConfig.Peer.ExpiryTimeout
 	now := time.Now()
 
 	for name, peer := range m.peers {

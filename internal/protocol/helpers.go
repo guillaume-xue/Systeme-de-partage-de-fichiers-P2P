@@ -24,34 +24,19 @@ func GetServerUDPv6() string {
 	return "[2001:660:3301:9243::51c2:1ee5]:8443"
 }
 
+// typeNames associe chaque type de message à son nom lisible
+var typeNames = map[uint8]string{
+	Ping: "Ping", Ok: "Ok", Error: "Error",
+	Hello: "Hello", HelloReply: "HelloReply",
+	RootRequest: "RootRequest", RootReply: "RootReply",
+	DatumRequest: "DatumRequest", Datum: "Datum", NoDatum: "NoDatum",
+	NatTraversalRequest: "NatTraversalRequest", NatTraversalRequest2: "NatTraversalRequest2",
+}
+
 // GetTypeName retourne le nom lisible d'un type de message
 func GetTypeName(typ uint8) string {
-	switch typ {
-	case Ping:
-		return "Ping"
-	case Ok:
-		return "Ok"
-	case Error:
-		return "Error"
-	case Hello:
-		return "Hello"
-	case HelloReply:
-		return "HelloReply"
-	case RootRequest:
-		return "RootRequest"
-	case RootReply:
-		return "RootReply"
-	case DatumRequest:
-		return "DatumRequest"
-	case Datum:
-		return "Datum"
-	case NoDatum:
-		return "NoDatum"
-	case NatTraversalRequest:
-		return "NatTraversalRequest"
-	case NatTraversalRequest2:
-		return "NatTraversalRequest2"
-	default:
-		return "Unknown"
+	if name, ok := typeNames[typ]; ok {
+		return name
 	}
+	return "Unknown"
 }

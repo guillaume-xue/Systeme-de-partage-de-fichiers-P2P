@@ -1,7 +1,6 @@
 package merkle
 
 import (
-	"crypto/sha256"
 	"sync"
 )
 
@@ -14,12 +13,6 @@ func NewStore() *Store {
 	return &Store{
 		data: make(map[[32]byte][]byte),
 	}
-}
-
-func (s *Store) Add(datum []byte) [32]byte {
-	hash := sha256.Sum256(datum)
-	s.Set(hash, datum)
-	return hash
 }
 
 func (s *Store) Set(hash [32]byte, datum []byte) {

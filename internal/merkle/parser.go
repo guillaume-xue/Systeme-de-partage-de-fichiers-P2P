@@ -36,3 +36,21 @@ func GetEntryName(e DirEntry) string {
 	}
 	return string(e.Name[:])
 }
+
+// ExtractChildHashes retourne tous les hashs enfants d'un datum (dir, big-dir, big-file).
+// Retourne nil pour les chunks (feuilles sans enfants).
+func ExtractChildHashes(datum []byte) [][32]byte {
+	typ, content := ParseDatum(datum)
+	switch typ {
+	case TypeDirectory:
+		entries := ParseDirectoryEntries(content)
+		hashes := make([][32]byte, len(entries))
+		for i, e := range entries {
+			hashes[i] = e.Hash
+		}
+		return hashes
+	case TypeBigDirectory, TypeBig:
+		return ParseBigHashes(content)
+	}
+	return nil
+}

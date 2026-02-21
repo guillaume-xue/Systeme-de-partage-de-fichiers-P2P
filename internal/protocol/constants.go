@@ -24,10 +24,6 @@ const (
 	ExtNatTraversalRelay = 1
 )
 
-const (
-	MaxQueueSize = 1024
-)
-
 var (
-	Debug_Enable = false
+	DebugEnabled = false
 )

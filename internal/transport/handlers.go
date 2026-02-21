@@ -7,7 +7,6 @@ import (
 	"main/internal/crypto"
 	"main/internal/merkle"
 	"main/internal/protocol"
-	"main/internal/utils"
 	"net"
 	"time"
 )
@@ -22,12 +21,12 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 	// Log de la réception
 	typeName := protocol.GetTypeName(pkt.Header.Type)
 	// Juste pour éviter les spams de datum
-	if (pkt.Header.Type != protocol.Datum) || protocol.Debug_Enable {
-		fmt.Printf("📥 Réception %s ← %s (ID: %d)\n", typeName, addr, pkt.Header.ID)
+	if (pkt.Header.Type != protocol.Datum) || protocol.DebugEnabled {
+		fmt.Printf("ℹ️️ Réception %s ← %s (ID: %d)\n", typeName, addr, pkt.Header.ID)
 		if pkt.Header.Type == protocol.Datum {
 			fmt.Printf("    Header: %+v\n", pkt.Header)
-			fmt.Printf("    Body: %x\n", pkt.Body)
-			fmt.Printf("    Signature: %x\n", pkt.Signature)
+			fmt.Printf("    Body: %x\n", pkt.Body[:8])
+			fmt.Printf("    Signature: %x\n", pkt.Signature[:8])
 		}
 	}
 
@@ -59,123 +58,58 @@ func (s *Server) handlePacket(addr *net.UDPAddr, data []byte) {
 	case protocol.HelloReply:
 		s.onHello(pkt, addr, true)
 
-	// --- MERKLE TREE ---
-	case protocol.RootRequest:
-		if _, ok := s.Manager.GetByAddr(addr); !ok {
-			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
+	// --- Types nécessitant une authentification ---
+	case protocol.RootRequest, protocol.RootReply, protocol.DatumRequest,
+		protocol.Datum, protocol.NatTraversalRequest, protocol.NatTraversalRequest2:
+		if !s.requireAuth(addr, pkt.Header.ID) {
 			return
 		}
-		fmt.Printf("🌳 Demande de root hash de %s\n", addr)
-		s.mu.RLock()
-		rootHash := s.RootHash
-		s.mu.RUnlock()
-		SendRootReply(s.Conn, addr, rootHash, s.PrivKey, pkt.Header.ID)
-
-	case protocol.RootReply:
-		if _, ok := s.Manager.GetByAddr(addr); !ok {
-			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
-			return
+		switch pkt.Header.Type {
+		case protocol.RootRequest:
+			s.onRootRequest(pkt, addr)
+		case protocol.RootReply:
+			s.onRootReply(pkt, addr)
+		case protocol.DatumRequest:
+			s.onDatumRequest(pkt, addr)
+		case protocol.Datum:
+			s.onDatum(pkt, addr)
+		case protocol.NatTraversalRequest:
+			s.onNatRequest(pkt, addr)
+		case protocol.NatTraversalRequest2:
+			s.onNatRequest2(pkt, addr)
 		}
-		s.onRootReply(pkt, addr)
-
-	case protocol.DatumRequest:
-		if _, ok := s.Manager.GetByAddr(addr); !ok {
-			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
-			return
-		}
-		s.onDatumRequest(pkt, addr)
-
-	case protocol.Datum:
-		if _, ok := s.Manager.GetByAddr(addr); !ok {
-			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
-			return
-		}
-		s.onDatum(pkt, addr)
 
 	case protocol.NoDatum:
-		// Juste pour info/debug
-		// fmt.Printf("Peer %s n'a pas le datum demandé\n", addr)
-
-	// --- NAT TRAVERSAL ---
-	case protocol.NatTraversalRequest:
-		if _, ok := s.Manager.GetByAddr(addr); !ok {
-			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
-			return
+		if protocol.DebugEnabled {
+			fmt.Printf("Peer %s n'a pas le datum demandé\n", addr)
 		}
-		// On me demande de faire le relais
-		s.onNatRequest(pkt, addr)
-
-	case protocol.NatTraversalRequest2:
-		if _, ok := s.Manager.GetByAddr(addr); !ok {
-			SendError(s.Conn, addr, "please hello first", pkt.Header.ID)
-			return
-		}
-		// Le relais me dit de contacter quelqu'un
-		s.onNatRequest2(pkt, addr)
 
 	case protocol.Error:
 		fmt.Printf("⚠️ Erreur reçue de %s: %s\n", addr, string(pkt.Body))
 		if string(pkt.Body) == "please hello first" {
-			fmt.Println("🔄 Session perdue, tentative de reconnexion...")
+			fmt.Println("ℹ️️ Session perdue, tentative de reconnexion...")
 			SendHello(s.Conn, addr, s.MyName, s.PrivKey)
 			SendPing(s.Conn, addr)
 		}
 	}
 }
 
-// RegisterDatumRequest enregistre un hash + adresse pour n'accepter que les réponses du bon peer
-func (s *Server) RegisterDatumRequest(hash [32]byte, addr *net.UDPAddr) {
-	s.PendingDatumMu.Lock()
-	if s.PendingDatumRequests[hash] == nil {
-		s.PendingDatumRequests[hash] = make(map[string]struct{})
+// requireAuth vérifie que le peer est authentifié (a fait un Hello).
+// Envoie une erreur et retourne false sinon.
+func (s *Server) requireAuth(addr *net.UDPAddr, pktID uint32) bool {
+	if _, ok := s.Manager.GetByAddr(addr); !ok {
+		SendError(s.Conn, addr, "please hello first", pktID)
+		return false
 	}
-	s.PendingDatumRequests[hash][addr.String()] = struct{}{}
-	s.PendingDatumMu.Unlock()
+	return true
 }
 
-// UnregisterDatumRequest supprime un hash+addr des requêtes en attente
-func (s *Server) UnregisterDatumRequest(hash [32]byte, addr *net.UDPAddr) {
-	s.PendingDatumMu.Lock()
-	if peers, ok := s.PendingDatumRequests[hash]; ok {
-		delete(peers, addr.String())
-		if len(peers) == 0 {
-			delete(s.PendingDatumRequests, hash)
-		}
-	}
-	s.PendingDatumMu.Unlock()
-}
-
-// IsDatumExpected vérifie qu'on a bien demandé ce datum à ce peer précis
-func (s *Server) IsDatumExpected(hash [32]byte, addr *net.UDPAddr) bool {
-	s.PendingDatumMu.RLock()
-	peers, ok := s.PendingDatumRequests[hash]
-	if ok {
-		_, ok = peers[addr.String()]
-	}
-	s.PendingDatumMu.RUnlock()
-	return ok
-}
-
-// RegisterRootRequest enregistre qu'on attend un RootReply d'une adresse donnée
-func (s *Server) RegisterRootRequest(addr *net.UDPAddr) {
-	s.PendingRootRequestMu.Lock()
-	s.PendingRootRequests[addr.String()] = struct{}{}
-	s.PendingRootRequestMu.Unlock()
-}
-
-// UnregisterRootRequest supprime une adresse des RootRequest en attente
-func (s *Server) UnregisterRootRequest(addr *net.UDPAddr) {
-	s.PendingRootRequestMu.Lock()
-	delete(s.PendingRootRequests, addr.String())
-	s.PendingRootRequestMu.Unlock()
-}
-
-// IsRootReplyExpected vérifie qu'on attend un RootReply de cette adresse
-func (s *Server) IsRootReplyExpected(addr *net.UDPAddr) bool {
-	s.PendingRootRequestMu.Lock()
-	_, ok := s.PendingRootRequests[addr.String()]
-	s.PendingRootRequestMu.Unlock()
-	return ok
+func (s *Server) onRootRequest(pkt *protocol.Packet, addr *net.UDPAddr) {
+	fmt.Printf("ℹ️️ Demande de root hash de %s\n", addr)
+	s.mu.RLock()
+	rootHash := s.RootHash
+	s.mu.RUnlock()
+	SendRootReply(s.Conn, addr, rootHash, s.PrivKey, pkt.Header.ID)
 }
 
 func (s *Server) onHello(pkt *protocol.Packet, addr *net.UDPAddr, isReply bool) {
@@ -218,8 +152,6 @@ func (s *Server) onDatumRequest(pkt *protocol.Packet, addr *net.UDPAddr) {
 		return
 	}
 
-	// fmt.Printf("📦 Demande datum %x... de %s\n", hash[:8], addr)
-
 	// On cherche d'abord en local, sinon dans le cache téléchargé
 	s.mu.RLock()
 	data, ok := s.MerkleStore.Get(hash)
@@ -229,12 +161,12 @@ func (s *Server) onDatumRequest(pkt *protocol.Packet, addr *net.UDPAddr) {
 	}
 
 	if ok {
-		if protocol.Debug_Enable {
-			fmt.Printf("✅ Envoi datum %x... à %s\n", hash, addr)
+		if protocol.DebugEnabled {
+			fmt.Printf("ℹ️️ Envoi datum %x... à %s\n", hash, addr)
 		}
 		SendDatum(s.Conn, addr, hash, data, pkt.Header.ID)
 	} else {
-		fmt.Printf("❌ Datum %x... introuvable, envoi NoDatum à %s\n", hash, addr)
+		fmt.Printf("ℹ️️ Datum %x... introuvable, envoi NoDatum à %s\n", hash, addr)
 		SendNoDatum(s.Conn, addr, hash, s.PrivKey, pkt.Header.ID)
 	}
 }
@@ -246,7 +178,7 @@ func (s *Server) onDatum(pkt *protocol.Packet, addr *net.UDPAddr) {
 	}
 
 	// Vérifier qu'on a bien demandé ce datum à CE peer
-	if !s.IsDatumExpected(hash, addr) {
+	if !s.Pending.IsDatumExpected(hash, addr) {
 		// Si on a déjà ce datum, c'est un doublon inoffensif
 		// (réponse tardive suite à un retry dont l'original est arrivé entre-temps)
 		if _, alreadyHave := s.Downloads.Get(hash); alreadyHave {
@@ -263,7 +195,7 @@ func (s *Server) onDatum(pkt *protocol.Packet, addr *net.UDPAddr) {
 	}
 
 	// Retirer des requêtes en attente (on ne l'attend plus)
-	s.UnregisterDatumRequest(hash, addr)
+	s.Pending.UnregisterDatum(hash, addr)
 
 	// Stockage (idempotent si doublon, pas grave)
 	s.Downloads.Set(hash, val)
@@ -279,15 +211,15 @@ func (s *Server) onRootReply(pkt *protocol.Packet, addr *net.UDPAddr) {
 	}
 
 	// Vérifier qu'on a bien demandé un RootRequest à ce peer
-	if !s.IsRootReplyExpected(addr) {
+	if !s.Pending.IsRootExpected(addr) {
 		fmt.Printf("⚠️ RootReply non sollicité de %s, ignoré\n", addr)
 		return
 	}
 
-	fmt.Printf("🌳 Réception root hash %x... de %s\n", rootHash, addr)
+	fmt.Printf("ℹ️️ Réception root hash %x... de %s\n", rootHash, addr)
 
 	// Retirer des requêtes en attente
-	s.UnregisterRootRequest(addr)
+	s.Pending.UnregisterRoot(addr)
 
 	// Vérif signature
 	peer, ok := s.Manager.GetByAddr(addr)
@@ -311,152 +243,6 @@ func (s *Server) onRootReply(pkt *protocol.Packet, addr *net.UDPAddr) {
 	s.rootHashMu.Unlock()
 }
 
-// Logique NAT (Relais)
-func (s *Server) onNatRequest(pkt *protocol.Packet, srcAddr *net.UDPAddr) {
-	// Src demande à contacter Target via nous
-	targetStruct, err := protocol.DecodeSocketAddress(pkt.Body)
-	if err != nil {
-		return
-	}
-
-	// On vérifie la signature de Src
-	p, ok := s.Manager.GetByAddr(srcAddr)
-	if !ok || !crypto.VerifySignature(p.PublicKey, pkt.DataToSign(), pkt.Signature) {
-		fmt.Printf("❌ NatRequest d'un peer inconnu ou mauvaise signature: %s\n", srcAddr)
-		return
-	}
-
-	// Vérifier si on connaît la cible (si on est connecté avec elle)
-	targetAddr := targetStruct.ToUDPAddr()
-	targetPeer, targetKnown := s.Manager.GetByAddr(targetAddr)
-
-	if !targetKnown {
-		// La cible n'est pas dans nos pairs connectés, on ne peut pas relayer
-		fmt.Printf("⚠️ NAT: %s demande à contacter %s mais cette cible n'est pas connectée à nous\n", srcAddr, targetAddr)
-		SendError(s.Conn, srcAddr, "Cible non connecté", pkt.Header.ID)
-		return
-	}
-
-	// On dit OK à Src
-	SendOk(s.Conn, srcAddr, pkt.Header.ID)
-
-	// On envoie une notif à Target à l'adresse demandée
-	fmt.Printf("🔀 NAT: %s veut contacter %s (%s) via nous\n", srcAddr, targetPeer.Name, targetAddr)
-
-	// Envoyer NatTraversalRequest2 à l'adresse spécifique demandée par le source
-	SendNatTraversalRequest2(s.Conn, targetAddr, srcAddr, s.PrivKey)
-
-}
-
-func (s *Server) onNatRequest2(pkt *protocol.Packet, relayAddr *net.UDPAddr) {
-	// Le Relais nous dit que Src veut nous parler
-	srcStruct, err := protocol.DecodeSocketAddress(pkt.Body)
-	if err != nil {
-		return
-	}
-
-	// Vérification de la signature du relais
-	relay, ok := s.Manager.GetByAddr(relayAddr)
-	if !ok || !crypto.VerifySignature(relay.PublicKey, pkt.DataToSign(), pkt.Signature) {
-		fmt.Printf("❌ NatRequest2 d'un relais inconnu: %s\n", relayAddr)
-		return
-	}
-
-	// On dit merci au relais
-	SendOk(s.Conn, relayAddr, pkt.Header.ID)
-
-	srcAddr := srcStruct.ToUDPAddr()
-	srcAddrKey := srcAddr.String() // Cache une seule fois
-	fmt.Printf("🔀 NAT: %s nous demande de pinguer %s\n", relayAddr, srcAddrKey)
-
-	// Créer un canal pour détecter les réceptions de cette adresse
-	responseChan := make(chan *net.UDPAddr, 10)
-	s.PingResponseMu.Lock()
-	s.PingResponseChans[srcAddrKey] = responseChan
-	s.PingResponseMu.Unlock()
-
-	defer func() {
-		s.PingResponseMu.Lock()
-		delete(s.PingResponseChans, srcAddrKey)
-		s.PingResponseMu.Unlock()
-	}()
-
-	// Calculer le timeout total avec backoff exponentiel
-	count := 3
-	totalTimeout := utils.CalExpo2Time(count)
-
-	// Canal pour détecter le succès
-	success := make(chan bool, 1)
-	stopSending := make(chan bool)
-
-	go func() {
-		for {
-			select {
-			case receivedAddr := <-responseChan:
-				if receivedAddr.String() == srcAddrKey {
-					close(stopSending) // Signaler l'arrêt
-					select {
-					case success <- true:
-					default:
-					}
-					return
-				}
-			case <-time.After(totalTimeout):
-				select {
-				case success <- false:
-				default:
-				}
-				return
-			}
-		}
-	}()
-
-	// Envoyer des pings avec backoff exponentiel
-	for i := range count {
-		select {
-		case <-stopSending:
-			// Succès détecté, on arrête immédiatement
-			<-success
-			fmt.Printf("✅ NAT traversal réussi avec %s\n", srcAddr)
-			return
-		default:
-			SendPing(s.Conn, srcAddr)
-
-			// Attendre avec backoff exponentiel (sauf après le dernier ping)
-			if i < count-1 {
-				var waitTime time.Duration
-				if i == 0 {
-					waitTime = 1 * time.Second
-				} else {
-					waitTime = time.Duration(1<<uint(i)) * time.Second
-				}
-
-				// Attendre avec possibilité d'interruption
-				select {
-				case <-stopSending:
-					<-success
-					fmt.Printf("✅ NAT traversal réussi avec %s\n", srcAddr)
-					return
-				case <-time.After(waitTime):
-					// Continuer à la prochaine itération
-				}
-			}
-		}
-	}
-
-	// Attendre le résultat final
-	select {
-	case result := <-success:
-		if result {
-			fmt.Printf("✅ NAT traversal réussi avec %s\n", srcAddr)
-		} else {
-			fmt.Printf("⏱️ Timeout NAT avec %s\n", srcAddr)
-		}
-	case <-time.After(500 * time.Millisecond):
-		fmt.Printf("⏱️ Timeout NAT avec %s\n", srcAddr)
-	}
-}
-
 // --- Utils ---
 
 func (s *Server) getPublicKey(name string) ([]byte, error) {
@@ -464,12 +250,9 @@ func (s *Server) getPublicKey(name string) ([]byte, error) {
 		return crypto.PublicKeyToBytes(&s.PrivKey.PublicKey), nil
 	}
 
-	s.keyCacheMu.RLock()
-	if k, ok := s.keyCache[name]; ok {
-		s.keyCacheMu.RUnlock()
+	if k, ok := s.keyCache.Get(name); ok {
 		return k, nil
 	}
-	s.keyCacheMu.RUnlock()
 
 	// Appel HTTP (bloquant, mais bon...)
 	key, err := GetKey(name)
@@ -477,9 +260,7 @@ func (s *Server) getPublicKey(name string) ([]byte, error) {
 		return nil, err
 	}
 
-	s.keyCacheMu.Lock()
-	s.keyCache[name] = key
-	s.keyCacheMu.Unlock()
+	s.keyCache.Set(name, key)
 	return key, nil
 }
 
@@ -497,8 +278,8 @@ func (s *Server) SetMerkleRoot(store *merkle.Store, root [32]byte) {
 	s.mu.Unlock()
 }
 
-// KeepAlive : Simple loop qui ping les copains
-func (s *Server) KeepAlive(serverAddr *net.UDPAddr, interval time.Duration, ctx context.Context) {
+// KeepAlive : Simple loop qui ping les copains et le serveur central
+func (s *Server) KeepAlive(ctx context.Context, serverAddr *net.UDPAddr, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -510,14 +291,15 @@ func (s *Server) KeepAlive(serverAddr *net.UDPAddr, interval time.Duration, ctx 
 			return
 		case <-ticker.C:
 			fmt.Println()
+			// Ping le serveur central pour maintenir la session
+			SendPing(s.Conn, serverAddr)
+
 			connectedPeers := s.Manager.List()
-			if len(connectedPeers) > 0 {
-				for _, peerName := range connectedPeers {
-					if peerInfo, ok := s.Manager.Get(peerName); ok {
-						for _, addrInfo := range peerInfo.Addrs {
-							SendPing(s.Conn, addrInfo.Addr)
-							time.Sleep(1 * time.Millisecond)
-						}
+			for _, peerName := range connectedPeers {
+				if peerInfo, ok := s.Manager.Get(peerName); ok {
+					for _, addrInfo := range peerInfo.Addrs {
+						SendPing(s.Conn, addrInfo.Addr)
+						time.Sleep(1 * time.Millisecond)
 					}
 				}
 			}
