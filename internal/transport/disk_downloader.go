@@ -22,15 +22,13 @@ type task struct {
 
 // DiskDownloader : Télécharge direct sur le disque
 type DiskDownloader struct {
-	server    *Server
-	peer      *net.UDPAddr
+	downloadBase
+
 	outputDir string
 	tempDir   string // dossier pour les chunks temporaires
-	tracker   *InflightTracker
 
 	// Files d'attente
-	workQueue  chan task
-	responseCh chan [32]byte // Signale qu'un hash est arrivé
+	workQueue chan task
 
 	// Map pour se souvenir où écrire quoi
 	pathMap   map[[32]byte]string
@@ -50,12 +48,6 @@ type DiskDownloader struct {
 	savedBytes int64
 	statsMu    sync.Mutex
 
-	// Lifecycle
-	wg          sync.WaitGroup
-	unsubscribe func()
-	running     bool
-	done        chan struct{}
-
 	// Nom réel de la racine (extrait du répertoire parent)
 	rootName string
 
@@ -71,24 +63,17 @@ func NewDiskDownloader(server *Server, peer *net.UDPAddr, output string) *DiskDo
 		fmt.Printf("⚠️ Impossible de créer le dossier temporaire: %v\n", err)
 	}
 
-	cfg := config.GlobalConfig.Network
-	fc := NewFlowControl(cfg.InitialWindow, cfg.MinWindowSize, cfg.MaxWindowSize, cfg.TimeoutDownload)
 	return &DiskDownloader{
-		server:    server,
-		peer:      peer,
-		outputDir: output,
-		tempDir:   tempDir,
-		tracker:   NewInflightTracker(fc, server.Pending, peer),
+		downloadBase: newDownloadBase(server, peer),
+		outputDir:    output,
+		tempDir:      tempDir,
 
-		workQueue:  make(chan task, config.GlobalConfig.Network.MaxQueueSize),
-		responseCh: make(chan [32]byte, config.GlobalConfig.Network.MaxQueueSize),
+		workQueue: make(chan task, config.GlobalConfig.Network.MaxQueueSize),
 
 		pathMap:        make(map[[32]byte]string),
 		bigFiles:       make(map[[32]byte]string),
 		structureCache: make(map[[32]byte][]byte),
 
-		running:      true,
-		done:         make(chan struct{}),
 		processorSem: make(chan struct{}, config.GlobalConfig.Network.ProcessorWorkers),
 	}
 }
@@ -162,13 +147,8 @@ func (d *DiskDownloader) onDatumReceived(hash [32]byte, data []byte) {
 		d.structureCacheMu.Unlock()
 	}
 
-	// Signal garanti via goroutine
-	go func() {
-		select {
-		case d.responseCh <- hash:
-		case <-d.done:
-		}
-	}()
+	// Signal garanti via signalResponse (méthode de downloadBase)
+	d.signalResponse(hash)
 }
 
 // writeTempChunk écrit un chunk sur le disque dans le dossier temp
@@ -209,7 +189,7 @@ func (d *DiskDownloader) senderLoop() {
 
 			d.trackPath(tache.hash, tache.path)
 			d.tracker.Track(tache.hash)
-			SendDatumRequest(d.server.Conn, d.peer, tache.hash)
+			SendDatumRequest(d.server.Conn, d.peerAddr, tache.hash)
 		case <-d.done:
 			return
 		}

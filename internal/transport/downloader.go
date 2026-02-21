@@ -13,44 +13,24 @@ import (
 // Contrairement au DiskDownloader, on ne stocke pas les fichiers sur le disque,
 // on remplit juste le store "server.Downloads".
 type Downloader struct {
-	server   *Server
-	peerAddr *net.UDPAddr
-	tracker  *InflightTracker
+	downloadBase
 
 	// Stats de progression
 	totalReceived int
 	statsMu       sync.Mutex
 
 	// Communication interne
-	workCh     chan [32]byte // File d'attente des hash à demander
-	responseCh chan [32]byte // Signal de réception
+	workCh chan [32]byte // File d'attente des hash à demander
 
 	// Buffer de débordement pour ne jamais perdre de hash
 	overflowMu sync.Mutex
 	overflow   [][32]byte
-
-	done chan struct{}
-
-	// Contrôle
-	running     bool
-	wg          sync.WaitGroup
-	unsubscribe func() // Closure de nettoyage du dispatcher
 }
 
 func NewDownloader(server *Server, peerAddr *net.UDPAddr) *Downloader {
-	cfg := config.GlobalConfig.Network
-	fc := NewFlowControl(cfg.InitialWindow, cfg.MinWindowSize, cfg.MaxWindowSize, cfg.TimeoutDownload)
 	return &Downloader{
-		server:   server,
-		peerAddr: peerAddr,
-		tracker:  NewInflightTracker(fc, server.Pending, peerAddr),
-
-		// Buffer large pour ne pas bloquer l'exploration récursive
-		workCh:     make(chan [32]byte, cfg.MaxQueueSize),
-		responseCh: make(chan [32]byte, cfg.MaxQueueSize),
-
-		done:    make(chan struct{}),
-		running: true,
+		downloadBase: newDownloadBase(server, peerAddr),
+		workCh:       make(chan [32]byte, config.GlobalConfig.Network.MaxQueueSize),
 	}
 }
 
@@ -95,14 +75,7 @@ func (d *Downloader) DownloadTree(rootHash [32]byte) {
 // Callback du dispatcher — retrait immédiat de pending pour éviter les faux timeouts
 func (d *Downloader) onDatumReceived(hash [32]byte, _ []byte) {
 	d.tracker.OnReceived(hash)
-
-	// Signal garanti : goroutine pour ne pas bloquer le callback UDP
-	go func() {
-		select {
-		case d.responseCh <- hash:
-		case <-d.done:
-		}
-	}()
+	d.signalResponse(hash)
 }
 
 // Worker 1 : Envoie les demandes

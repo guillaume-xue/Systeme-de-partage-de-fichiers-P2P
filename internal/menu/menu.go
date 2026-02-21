@@ -23,6 +23,15 @@ import (
 	Structure et fonctions du menu interactif
 */
 
+// BrowseMode définit le mode de navigation dans la liste des peers
+type BrowseMode int
+
+const (
+	ModeList     BrowseMode = iota // Juste lister les peers
+	ModeExplore                    // Explorer en mémoire
+	ModeDownload                   // Télécharger sur disque
+)
+
 type InteractiveMenu struct {
 	server     *transport.Server
 	serverAddr *net.UDPAddr
@@ -67,11 +76,11 @@ func (m *InteractiveMenu) Run(ctx context.Context) {
 
 		switch choice {
 		case "1":
-			m.listDirectoryPeers(false, false, ctx) // Juste liste, pas d'exploration ni téléchargement
+			m.listDirectoryPeers(ModeList, ctx)
 		case "2":
-			m.listDirectoryPeers(true, false, ctx) // Exploration en mémoire (pas de sauvegarde sur disque)
+			m.listDirectoryPeers(ModeExplore, ctx)
 		case "3":
-			m.listDirectoryPeers(true, true, ctx) // Téléchargement sur disque
+			m.listDirectoryPeers(ModeDownload, ctx)
 		case "4":
 			m.showConnections()
 		case "5":
@@ -93,8 +102,21 @@ func (m *InteractiveMenu) Run(ctx context.Context) {
 	}
 }
 
+// extractBaseName extrait le dernier composant d'un chemin utilisateur.
+// Retourne "" si l'input est vide, "root", ou un hash hex.
+func extractBaseName(input string) string {
+	if input == "" || input == "root" || looksLikeHash(input) {
+		return ""
+	}
+	clean := strings.TrimRight(input, "/")
+	if idx := strings.LastIndex(clean, "/"); idx >= 0 {
+		return clean[idx+1:]
+	}
+	return clean
+}
+
 // 1. Lister les peers
-func (m *InteractiveMenu) listDirectoryPeers(browseMode, diskCache bool, ctx context.Context) {
+func (m *InteractiveMenu) listDirectoryPeers(mode BrowseMode, ctx context.Context) {
 	fmt.Println("Récupération liste...")
 	peers, err := transport.GetListPeers()
 	if err != nil {
@@ -110,7 +132,7 @@ func (m *InteractiveMenu) listDirectoryPeers(browseMode, diskCache bool, ctx con
 		fmt.Printf(" [%d] %s\n", i+1, p)
 	}
 
-	if !browseMode {
+	if mode == ModeList {
 		m.waitKey()
 		return
 	}
@@ -132,7 +154,7 @@ func (m *InteractiveMenu) listDirectoryPeers(browseMode, diskCache bool, ctx con
 		pInfo, _ = m.server.Manager.Get(pName)
 	}
 
-	if diskCache {
+	if mode == ModeDownload {
 		m.downloadManual(pName, pInfo, ctx)
 	} else {
 		m.explorePeer(pName, pInfo)
@@ -158,15 +180,7 @@ func (m *InteractiveMenu) explorePeer(pName string, pInfo *peer.PeerInfo) {
 	}
 
 	// Extraire le nom d'affichage depuis le chemin (dernier composant)
-	displayName := ""
-	if input != "" && input != "root" && !looksLikeHash(input) {
-		clean := strings.TrimRight(input, "/")
-		if idx := strings.LastIndex(clean, "/"); idx >= 0 {
-			displayName = clean[idx+1:]
-		} else {
-			displayName = clean
-		}
-	}
+	displayName := extractBaseName(input)
 
 	// On télécharge l'arborescence depuis le hash cible
 	fmt.Println("\nℹ️ Téléchargement de l'arborescence en cours...")
@@ -200,15 +214,7 @@ func (m *InteractiveMenu) downloadManual(pName string, pInfo *peer.PeerInfo, ctx
 	defer cancel()
 
 	// Extraire le vrai nom depuis le chemin d'entrée (dernier composant)
-	rootName := ""
-	if input != "" && input != "root" && !looksLikeHash(input) {
-		clean := strings.TrimRight(input, "/")
-		if idx := strings.LastIndex(clean, "/"); idx >= 0 {
-			rootName = clean[idx+1:]
-		} else {
-			rootName = clean
-		}
-	}
+	rootName := extractBaseName(input)
 
 	destDir := filepath.Join("downloads", utils.CleanName(pName))
 	fmt.Printf("ℹ️️ Destination: %s\n", destDir)

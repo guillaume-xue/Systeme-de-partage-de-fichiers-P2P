@@ -5,7 +5,6 @@ import (
 	"main/internal/config"
 	"main/internal/crypto"
 	"main/internal/protocol"
-	"main/internal/utils"
 	"net"
 	"time"
 )
@@ -82,76 +81,15 @@ func (s *Server) onNatRequest2(pkt *protocol.Packet, relayAddr *net.UDPAddr) {
 
 	// Calculer le timeout total avec backoff exponentiel
 	count := config.GlobalConfig.NAT.PingCount
-	totalTimeout := utils.CalExpo2Time(count)
-
-	// Canal pour détecter le succès
-	success := make(chan bool, 1)
-	stopSending := make(chan bool)
-
-	go func() {
-		for {
-			select {
-			case receivedAddr := <-responseChan:
-				if receivedAddr.String() == srcAddrKey {
-					close(stopSending) // Signaler l'arrêt
-					select {
-					case success <- true:
-					default:
-					}
-					return
-				}
-			case <-time.After(totalTimeout):
-				select {
-				case success <- false:
-				default:
-				}
-				return
-			}
-		}
-	}()
-
-	// Envoyer des pings avec backoff exponentiel
-	for i := range count {
-		select {
-		case <-stopSending:
-			// Succès détecté, on arrête immédiatement
-			<-success
-			fmt.Printf("✅ NAT traversal réussi avec %s\n", srcAddr)
-			return
-		default:
-			SendPing(s.Conn, srcAddr)
-
-			// Attendre avec backoff exponentiel (sauf après le dernier ping)
-			if i < count-1 {
-				var waitTime time.Duration
-				if i == 0 {
-					waitTime = time.Duration(config.GlobalConfig.NAT.InitialPingDelaySeconds) * time.Second
-				} else {
-					waitTime = time.Duration(1<<uint(i)) * time.Second
-				}
-
-				// Attendre avec possibilité d'interruption
-				select {
-				case <-stopSending:
-					<-success
-					fmt.Printf("✅ NAT traversal réussi avec %s\n", srcAddr)
-					return
-				case <-time.After(waitTime):
-					// Continuer à la prochaine itération
-				}
-			}
-		}
-	}
-
-	// Attendre le résultat final
-	select {
-	case result := <-success:
-		if result {
-			fmt.Printf("✅ NAT traversal réussi avec %s\n", srcAddr)
-		} else {
-			fmt.Printf("⚠️ Timeout NAT avec %s\n", srcAddr)
-		}
-	case <-time.After(time.Duration(config.GlobalConfig.NAT.FinalTimeoutMs) * time.Millisecond):
+	result := PingWithBackoff(
+		s.Conn, []*net.UDPAddr{srcAddr}, count,
+		time.Duration(config.GlobalConfig.NAT.InitialPingDelaySeconds)*time.Second,
+		time.Duration(config.GlobalConfig.NAT.FinalTimeoutMs)*time.Millisecond,
+		responseChan,
+	)
+	if result {
+		fmt.Printf("✅ NAT traversal réussi avec %s\n", srcAddr)
+	} else {
 		fmt.Printf("⚠️ Timeout NAT avec %s\n", srcAddr)
 	}
 }

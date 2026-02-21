@@ -1,35 +1,11 @@
 package merkle
 
-import (
-	"sync"
-)
+import "main/internal/utils"
 
-type Store struct {
-	data map[[32]byte][]byte
-	mu   sync.RWMutex
-}
+// Store est le stockage thread-safe des datums Merkle.
+// Utilise SafeMap générique pour éviter la duplication de code.
+type Store = utils.SafeMap[[32]byte, []byte]
 
 func NewStore() *Store {
-	return &Store{
-		data: make(map[[32]byte][]byte),
-	}
-}
-
-func (s *Store) Set(hash [32]byte, datum []byte) {
-	s.mu.Lock()
-	s.data[hash] = datum
-	s.mu.Unlock()
-}
-
-func (s *Store) Get(hash [32]byte) ([]byte, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	data, ok := s.data[hash]
-	return data, ok
-}
-
-func (s *Store) Len() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.data)
+	return utils.NewSafeMap[[32]byte, []byte]()
 }

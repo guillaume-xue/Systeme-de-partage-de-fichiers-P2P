@@ -64,11 +64,15 @@ func DetectLocalIPProtocol() (hasIPv4, hasIPv6 bool) {
 	return
 }
 
+// IsIPv4 vérifie si une adresse UDP est IPv4
+func IsIPv4(addr *net.UDPAddr) bool {
+	return addr.IP.To4() != nil
+}
+
 func SeparateAddressesByProtocol(filteredTargets []*net.UDPAddr) ([]*net.UDPAddr, []*net.UDPAddr) {
-	// Séparer les adresses par protocole
 	var targetIPv4, targetIPv6 []*net.UDPAddr
 	for _, addr := range filteredTargets {
-		if addr.IP.To4() != nil {
+		if IsIPv4(addr) {
 			targetIPv4 = append(targetIPv4, addr)
 		} else {
 			targetIPv6 = append(targetIPv6, addr)
@@ -88,7 +92,7 @@ func AddrParserSolver(rawAddr string) (targets []*net.UDPAddr) {
 		if resolvedAddr, err := net.ResolveUDPAddr("udp", addrLine); err == nil {
 			targets = append(targets, resolvedAddr)
 			ipVersion := "IPv4"
-			if resolvedAddr.IP.To4() == nil {
+			if !IsIPv4(resolvedAddr) {
 				ipVersion = "IPv6"
 			}
 			fmt.Printf("-> Trouvé: %s [%s]\n", addrLine, ipVersion)

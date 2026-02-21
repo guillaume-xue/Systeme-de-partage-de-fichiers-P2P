@@ -52,7 +52,7 @@ func (m *InteractiveMenu) connectToPeer(pName string) {
 		// Vérifier quels protocoles manquent
 		hasIPv4, hasIPv6 := false, false
 		for _, addrInfo := range peerInfo.Addrs {
-			if addrInfo.Addr.IP.To4() != nil {
+			if utils.IsIPv4(addrInfo.Addr) {
 				hasIPv4 = true
 			} else {
 				hasIPv6 = true
@@ -198,61 +198,12 @@ func (m *InteractiveMenu) sendNatTraversalViaPeer(targetAddresses []*net.UDPAddr
 // pingSpam envoie plusieurs pings pour percer le NAT avec backoff exponentiel.
 // Retourne true dès réception d'un ping du pair ou d'un OK en réponse.
 func (m *InteractiveMenu) pingSpam(addresses []*net.UDPAddr, count int, responseChan chan *net.UDPAddr) bool {
-	targetAddrs := make(map[string]bool)
-	for _, addr := range addresses {
-		targetAddrs[addr.String()] = true
-	}
-
-	totalTimeout := utils.CalExpo2Time(count)
-
-	pierced := make(chan bool, 1)
-	go func() {
-		timeout := time.After(totalTimeout)
-		for {
-			select {
-			case receivedAddr := <-responseChan:
-				if targetAddrs[receivedAddr.String()] {
-					pierced <- true
-					return
-				}
-			case <-timeout:
-				pierced <- false
-				return
-			}
-		}
-	}()
-
-	for i := range count {
-		for _, addr := range addresses {
-			transport.SendPing(m.server.Conn, addr)
-		}
-
-		select {
-		case result := <-pierced:
-			return result
-		default:
-		}
-
-		if i < count-1 {
-			waitTime := time.Second
-			if i > 0 {
-				waitTime = time.Duration(1<<uint(i)) * time.Second
-			}
-
-			select {
-			case result := <-pierced:
-				return result
-			case <-time.After(waitTime):
-			}
-		}
-	}
-
-	select {
-	case result := <-pierced:
-		return result
-	case <-time.After(time.Duration(config.GlobalConfig.NAT.PingSpamFinalTimeoutMs) * time.Millisecond):
-		return false
-	}
+	return transport.PingWithBackoff(
+		m.server.Conn, addresses, count,
+		time.Second,
+		time.Duration(config.GlobalConfig.NAT.PingSpamFinalTimeoutMs)*time.Millisecond,
+		responseChan,
+	)
 }
 
 // filterAddressesByProtocol filtre les adresses en fonction des protocoles IP locaux
@@ -264,7 +215,7 @@ func (m *InteractiveMenu) filterAddressesByProtocol(addresses []*net.UDPAddr) []
 
 	var filtered []*net.UDPAddr
 	for _, addr := range addresses {
-		isIPv4 := addr.IP.To4() != nil
+		isIPv4 := utils.IsIPv4(addr)
 		if isIPv4 && m.hasIPv4 {
 			filtered = append(filtered, addr)
 		} else if !isIPv4 && m.hasIPv6 {

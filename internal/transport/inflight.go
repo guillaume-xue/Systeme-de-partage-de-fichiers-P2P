@@ -15,10 +15,7 @@ import (
 */
 
 func GetMaxRetries() int {
-	if config.GlobalConfig != nil {
-		return config.GlobalConfig.Network.MaxRetries
-	}
-	return 3
+	return config.GlobalConfig.Network.MaxRetries
 }
 
 type InflightTracker struct {

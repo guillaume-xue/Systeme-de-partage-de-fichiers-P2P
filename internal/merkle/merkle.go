@@ -22,24 +22,15 @@ const (
 
 // Valeurs paramétrables depuis la config (remplace les anciennes constantes)
 func GetMaxChunkSize() int {
-	if config.GlobalConfig != nil {
-		return config.GlobalConfig.Merkle.MaxChunkSize
-	}
-	return 1024
+	return config.GlobalConfig.Merkle.MaxChunkSize
 }
 
 func GetMaxDirEntries() int {
-	if config.GlobalConfig != nil {
-		return config.GlobalConfig.Merkle.MaxDirEntries
-	}
-	return 16
+	return config.GlobalConfig.Merkle.MaxDirEntries
 }
 
 func GetMaxBigChildren() int {
-	if config.GlobalConfig != nil {
-		return config.GlobalConfig.Merkle.MaxBigChildren
-	}
-	return 32
+	return config.GlobalConfig.Merkle.MaxBigChildren
 }
 
 // DirEntry: une ligne dans un répertoire

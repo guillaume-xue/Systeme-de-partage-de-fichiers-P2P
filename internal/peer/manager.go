@@ -3,6 +3,7 @@ package peer
 import (
 	"crypto/ecdsa"
 	"main/internal/config"
+	"main/internal/utils"
 	"net"
 	"sync"
 	"time"
@@ -26,7 +27,7 @@ func (m *Manager) AddOrUpdate(name string, addr *net.UDPAddr, pubKey *ecdsa.Publ
 	defer m.mu.Unlock()
 
 	now := time.Now()
-	isIPv4 := addr.IP.To4() != nil
+	isIPv4 := utils.IsIPv4(addr)
 
 	if peer, exists := m.peers[name]; exists {
 		peer.LastSeen = now
@@ -35,7 +36,7 @@ func (m *Manager) AddOrUpdate(name string, addr *net.UDPAddr, pubKey *ecdsa.Publ
 		// Chercher et remplacer l'adresse du même protocole
 		found := false
 		for i := range peer.Addrs {
-			existingIsIPv4 := peer.Addrs[i].Addr.IP.To4() != nil
+			existingIsIPv4 := utils.IsIPv4(peer.Addrs[i].Addr)
 			if existingIsIPv4 == isIPv4 {
 				// Remplacer l'adresse du même protocole
 				peer.Addrs[i].Addr = addr
