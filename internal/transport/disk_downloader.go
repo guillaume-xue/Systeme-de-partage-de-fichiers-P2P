@@ -56,6 +56,9 @@ type DiskDownloader struct {
 	running     bool
 	done        chan struct{}
 
+	// Nom réel de la racine (extrait du répertoire parent)
+	rootName string
+
 	// Semaphore pour limiter les goroutines de processing
 	processorSem    chan struct{}
 	processingCount int
@@ -90,8 +93,10 @@ func NewDiskDownloader(server *Server, peer *net.UDPAddr, output string) *DiskDo
 	}
 }
 
-// DownloadToDisk télécharge l'arborescence complète et la sauvegarde sur disque
-func (d *DiskDownloader) DownloadToDisk(ctx context.Context, rootHash [32]byte) error {
+// DownloadToDisk télécharge l'arborescence complète et la sauvegarde sur disque.
+// rootName est le nom réel du fichier/dossier racine (extrait du parent). Si vide, un nom basé sur le hash est utilisé.
+func (d *DiskDownloader) DownloadToDisk(ctx context.Context, rootHash [32]byte, rootName string) error {
+	d.rootName = rootName
 	if err := os.MkdirAll(d.outputDir, 0755); err != nil {
 		return fmt.Errorf("mkdir fail: %v", err)
 	}
@@ -366,11 +371,15 @@ func (d *DiskDownloader) processDatum(hash [32]byte, destPath string) {
 	typ, content := merkle.ParseDatum(data)
 
 	if destPath == "__ROOT__" {
-		if typ == merkle.TypeDirectory || typ == merkle.TypeBigDirectory {
-			destPath = filepath.Join(d.outputDir, fmt.Sprintf("dir_%x", hash))
-		} else {
-			destPath = filepath.Join(d.outputDir, fmt.Sprintf("file_%x", hash))
+		name := d.rootName
+		if name == "" {
+			if typ == merkle.TypeDirectory || typ == merkle.TypeBigDirectory {
+				name = fmt.Sprintf("dir_%x", hash)
+			} else {
+				name = fmt.Sprintf("file_%x", hash)
+			}
 		}
+		destPath = filepath.Join(d.outputDir, name)
 		fmt.Printf("ℹ️️ Type détecté: %d, destination: %s\n", typ, destPath)
 	}
 

@@ -199,10 +199,21 @@ func (m *InteractiveMenu) downloadManual(pName string, pInfo *peer.PeerInfo, ctx
 	dlCtx, cancel := context.WithTimeout(ctx, config.GlobalConfig.Network.DownloadTimeout)
 	defer cancel()
 
+	// Extraire le vrai nom depuis le chemin d'entrée (dernier composant)
+	rootName := ""
+	if input != "" && input != "root" && !looksLikeHash(input) {
+		clean := strings.TrimRight(input, "/")
+		if idx := strings.LastIndex(clean, "/"); idx >= 0 {
+			rootName = clean[idx+1:]
+		} else {
+			rootName = clean
+		}
+	}
+
 	destDir := filepath.Join("downloads", utils.CleanName(pName))
 	fmt.Printf("ℹ️️ Destination: %s\n", destDir)
 	diskDownloader := transport.NewDiskDownloader(m.server, pInfo.GetAddr(), destDir)
-	if err := diskDownloader.DownloadToDisk(dlCtx, targetHash); err != nil {
+	if err := diskDownloader.DownloadToDisk(dlCtx, targetHash, rootName); err != nil {
 		fmt.Printf("❌ Erreur lors du téléchargement: %v\n", err)
 	}
 	m.waitKey()
