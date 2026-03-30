@@ -1,0 +1,7 @@
+shared/*
+downloads/*
+bin/*
+*.aux
+*.log
+*.out
+*.toc
