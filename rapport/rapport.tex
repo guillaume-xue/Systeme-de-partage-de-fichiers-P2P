@@ -1,0 +1,446 @@
+\documentclass[11pt,a4paper]{report}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{geometry}
+
+\geometry{margin=2.5cm}
+
+% Configuration pour les listings de code
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  stringstyle=\color{red}
+}
+
+\title{Rapport de Projet\\Programmation Internet\\Système de Partage de Fichiers P2P}
+\author{Guillaume Xue : 22101031 \\ David Yu : 22110478}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+
+\chapter{Introduction}
+
+Ce projet crée un système de partage de fichiers peer-to-peer (P2P) avec un serveur central. Le serveur gère la découverte des pairs et l'échange des clés. Tout communique en UDP et on utilise un arbre de Merkle pour vérifier que les données ne sont pas corrompues.
+
+\section{Objectifs du projet}
+
+Le client doit pouvoir :
+\begin{itemize}
+    \item S'inscrire auprès du serveur et rester connecté
+    \item Partager ses fichiers avec les autres
+    \item Télécharger des fichiers depuis d'autres utilisateurs
+    \item Fonctionner même derrière un NAT
+    \item Gérer les téléchargements efficacement avec une fenêtre glissante
+\end{itemize}
+
+\section{Architecture générale}
+
+On l'a écrit en Go avec plusieurs parties :
+\begin{itemize}
+    \item \textbf{Transport} : Gère la communication en UDP
+    \item \textbf{Merkle} : Crée les arbres Merkle pour les fichiers
+    \item \textbf{Crypto} : Gère les clés et les signatures
+    \item \textbf{Peer} : Tient à jour la liste des autres utilisateurs
+    \item \textbf{Protocol} : Définit les types de messages
+\end{itemize}
+
+\chapter{Implementation minimum}
+\section{Enregistrement serveur central}
+
+\subsection{Enregistrement de la clé publique}
+D'abord, on envoie notre clé publique au serveur central. Le serveur la stocke pour que les autres puissent la récupérer et vérifier nos signatures.
+
+\subsection{Enregistrement de l'adresse IP et du port}
+
+Pour enregistrer notre adresse IP, on utilise \texttt{TryConnectWithFallback}. On essaie d'abord de se connecter en IPv6, et si ça ne marche pas, on bascule sur IPv4.
+
+\subsubsection{Connexion IPv4/IPv6}
+
+La fonction \texttt{TryConnectWithFallback} fonctionne en deux étapes :
+
+\paragraph{Étape 1 : Ouvrir la connexion}
+On essaie d'abord d'ouvrir un socket IPv6 :
+\begin{lstlisting}[language=Go]
+addrV6, _ := net.ResolveUDPAddr("udp", "[::]:0")
+conn, err = net.ListenUDP("udp", addrV6)
+\end{lstlisting}
+
+Si ça ne marche pas, on bascule sur IPv4 :
+\begin{lstlisting}[language=Go]
+addrV4, _ := net.ResolveUDPAddr("udp4", "0.0.0.0:0")
+conn, err = net.ListenUDP("udp4", addrV4)
+\end{lstlisting}
+
+On met le port à 0 pour que le système choisisse un port libre automatiquement.
+
+\paragraph{Étape 2 : Se connecter au serveur}
+Après, on détermine quelle adresse du serveur utiliser. On préfère IPv6, sinon on essaie IPv4 :
+
+\begin{lstlisting}[language=Go]
+if isDualStack {
+    targets = append(targets, protocol.GetServerUDPv6())
+}
+targets = append(targets, protocol.GetServerUDPv4())
+\end{lstlisting}
+
+Pour chaque adresse du serveur, on :
+\begin{enumerate}
+    \item Envoie un \texttt{Hello} signé avec notre clé privée
+    \item On attend une réponse (max 2 secondes)
+    \item On vérifie que c'est bien la bonne réponse en regardant l'ID
+\end{enumerate}
+
+\subsubsection{Attendre la réponse}
+
+\texttt{waitResponse} attend la réponse du serveur :
+
+\begin{lstlisting}[language=Go]
+deadline := time.Now().Add(2 * time.Second)
+conn.SetReadDeadline(deadline)
+\end{lstlisting}
+
+Elle vérifie que :
+\begin{itemize}
+    \item L'ID correspond à celui qu'on a envoyé
+    \item Le type de message est correct
+\end{itemize}
+
+\subsubsection{Double connexion}
+
+Quand on est connecté en IPv6, on envoie aussi un ping sur IPv4 :
+
+\begin{lstlisting}[language=Go]
+if isDualStack && targetStr == protocol.GetServerUDPv6() {
+    if otherAddr, err := net.ResolveUDPAddr("udp", 
+                         protocol.GetServerUDPv4()); err == nil {
+        SendHello(conn, otherAddr, name, privKey)
+    }
+}
+\end{lstlisting}
+
+Ça permet au serveur de nous enregistrer sur les deux protocoles.
+
+\subsection{Maintien de la connexion}
+
+Une fois connecté, on doit rester en contact avec le serveur et les autres utilisateurs. On utilise des pings réguliers pour ça.
+
+\subsubsection{Mécanisme de keep-alive}
+
+La fonction \texttt{KeepAlive} s'exécute en arrière-plan et envoie régulièrement des pings. Elle utilise un ticker pour déclencher les pings :
+
+\begin{lstlisting}[language=Go]
+func (s *Server) KeepAlive(serverAddr *net.UDPAddr, 
+                          interval time.Duration, ctx context.Context) {
+    ticker := time.NewTicker(interval)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-s.shutdown:
+            return
+        case <-ticker.C:
+            // Logique de ping...
+        }
+    }
+}
+\end{lstlisting}
+
+\subsubsection{Stratégie de ping}
+
+À chaque cycle, on ping tous les autres utilisateurs connectés. Pour chaque utilisateur, on envoie un ping sur toutes ses adresses :
+
+\begin{lstlisting}[language=Go]
+connectedPeers := s.Manager.List()
+if len(connectedPeers) > 0 {
+    for _, peerName := range connectedPeers {
+        if peerInfo, ok := s.Manager.Get(peerName); ok {
+            for _, addrInfo := range peerInfo.Addrs {
+                SendPing(s.Conn, addrInfo.Addr)
+                time.Sleep(1 * time.Millisecond)
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+On attend 1 milliseconde entre chaque ping pour éviter de surcharger le réseau.
+
+Après avoir envoyé tous les pings, on nettoie la liste :
+
+\begin{lstlisting}[language=Go]
+s.Manager.CleanExpired()
+\end{lstlisting}
+
+Ça supprime les utilisateurs qui n'ont pas répondu depuis longtemps. Cette approche garantit que :
+\begin{itemize}
+    \item Les autres savent qu'on est actif
+    \item Les vieux utilisateurs sont enlevés de la liste
+    \item Les NAT gardent les ports ouverts
+\end{itemize}
+
+\subsubsection{Traiter les pings reçus}
+
+Quand on reçoit un ping d'un autre utilisateur, on répond immédiatement :
+
+\begin{lstlisting}[language=Go]
+case protocol.Ping:
+    SendOk(s.Conn, addr, pkt.Header.ID)
+\end{lstlisting}
+
+À chaque message reçu (pas juste les pings), on met à jour le timestamp de l'utilisateur pour savoir qu'il est actif. Ça permet de détecter rapidement si quelqu'un n'est plus en ligne.
+
+\section{Partage de fichiers et répertoires}
+
+\subsection{Structure de l'arbre de Merkle}
+
+On utilise un arbre de Merkle pour représenter les fichiers et répertoires. Chaque nœud a un hash SHA-256 unique, ce qui garantit que les données ne sont pas corrompues. Au démarrage, les fichiers locaux sont convertis en arbres Merkle.
+
+\subsubsection{Types de nœuds}
+
+Il y a quatre types de nœuds :
+
+\begin{itemize}
+    \item \textbf{Type 0 (Chunk)} : Données brutes d'un fichier (max 1024 octets)
+    \item \textbf{Type 1 (Directory)} : Répertoire simple (max 16 entrées)
+    \item \textbf{Type 2 (Big)} : Fichier fragmenté en plusieurs chunks (max 32 enfants)
+    \item \textbf{Type 3 (BigDirectory)} : Répertoire fragmenté (max 32 sous-répertoires)
+\end{itemize}
+
+\subsubsection{Stockage des fichiers}
+
+Le module \texttt{merkle} gère le stockage des données avec une structure thread-safe :
+
+\begin{lstlisting}[language=Go]
+type Store struct {
+    data map[[32]byte][]byte
+    mu   sync.RWMutex
+}
+
+func (s *Store) Add(datum []byte) [32]byte { ... }
+func (s *Store) Get(hash [32]byte) ([]byte, bool) { ... }
+\end{lstlisting}
+
+On a deux stores :
+\begin{itemize}
+    \item \texttt{MerkleStore} : Fichiers qu'on partage
+    \item \texttt{Downloads} : Fichiers qu'on a téléchargés depuis les autres
+\end{itemize}
+
+
+
+\section{Téléchargement de fichiers}
+
+\subsection{Architecture générale}
+
+Le téléchargement est géré par deux composants :
+
+\begin{itemize}
+    \item \textbf{Downloader} : Télécharge en mémoire pour explorer les fichiers
+    \item \textbf{DiskDownloader} : Télécharge et sauvegarde sur le disque
+\end{itemize}
+
+Un dispatcher centralisé gère les paquets reçus et peut notifier plusieurs downloader en même temps.
+
+\subsection{Fenêtre glissante adaptative}
+
+La fenêtre glissante contrôle le nombre de requêtes qu'on envoie en même temps. Elle s'ajuste selon la vitesse du réseau :
+
+\begin{lstlisting}[language=Go]
+type Downloader struct {
+    windowSize    int
+    maxWindowSize int
+    minWindowSize int
+    timeout       time.Duration
+    
+    pending map[[32]byte]time.Time
+    retries map[[32]byte]int
+}
+\end{lstlisting}
+
+Le downloader a trois workers qui tournent en parallèle :
+
+\begin{enumerate}
+    \item \textbf{senderLoop} : Envoie les demandes en respectant la taille de la fenêtre
+    \item \textbf{responseLoop} : Traite les réponses et ajuste la fenêtre
+    \item \textbf{monitorLoop} : Vérifie les timeouts et renvoie ce qui n'a pas répondu
+\end{enumerate}
+
+\subsection{Gestion des timeouts et retransmissions}
+
+Le \texttt{monitorLoop} vérifie les demandes qui n'ont pas eu de réponse :
+
+\begin{itemize}
+    \item Timeout : On renvoie la demande jusqu'à un max de tentatives
+    \item Ça échoue trop : On réduit la fenêtre
+    \item Abandon : On supprime si ça marche pas
+\end{itemize}
+
+La fenêtre s'ajuste :
+\begin{itemize}
+    \item Si c'est rapide : On l'augmente
+    \item Si c'est lent : On la réduit
+    \item Limites : Entre le min et le max configurés
+\end{itemize}
+
+\subsection{Téléchargement récursif}
+
+On télécharge tout l'arbre Merkle en descendant récursivement :
+
+\begin{enumerate}
+    \item Demander le hash racine
+    \item Recevoir le fichier racine
+    \item Voir quel type c'est et extraire les hashes enfants
+    \item Ajouter les enfants à la file d'attente
+    \item Recommencer jusqu'à avoir tout
+\end{enumerate}
+
+Ça permet de télécharger juste des fichiers ou des arborescences complètes selon ce qu'on veut.
+
+\chapter{Fonctionnalités avancées}
+
+\section{Interface utilisateur interactive}
+
+L'appli propose un menu interactif pour :
+
+\begin{itemize}
+    \item Voir les autres utilisateurs du réseau
+    \item Se connecter à un utilisateur
+    \item Explorer les fichiers d'un autre
+    \item Télécharger des fichiers manuellement
+    \item Voir les connexions actives
+    \item Voir ses propres fichiers
+    \item Activer le mode debug pour voir les paquets
+\end{itemize}
+
+Le module \texttt{menu} implémente ce menu avec :
+
+\begin{itemize}
+    \item \textbf{Run} : La boucle principale du menu
+    \item \textbf{listDirectoryPeers} : Affiche la liste des autres utilisateurs
+    \item \textbf{connectToPeer} : Se connecte à quelqu'un
+    \item \textbf{explorePeer} : Parcourt les fichiers d'un autre utilisateur
+    \item \textbf{downloadManual} : Télécharge un fichier par son hash
+    \item \textbf{showConnections} : Affiche qui est connecté
+    \item \textbf{showLocalFiles} : Affiche ses propres fichiers
+\end{itemize}
+
+\section{Gestion multi-protocoles IPv4/IPv6}
+
+On supporte les deux protocoles avec du fallback automatique.
+
+\subsection{Dual-Stack avec fallback automatique}
+
+\texttt{TryConnectWithFallback} se connecte en IPv6 d'abord, puis bascule sur IPv4.
+
+\subsubsection{Ouverture du socket local}
+
+On essaie d'ouvrir un socket IPv6 :
+
+\begin{lstlisting}[language=Go]
+addrV6, _ := net.ResolveUDPAddr("udp", "[::]:0")
+conn, err = net.ListenUDP("udp", addrV6)
+
+if err == nil {
+    isDualStack = true
+} else {
+    // Fallback IPv4
+    addrV4, _ := net.ResolveUDPAddr("udp4", "0.0.0.0:0")
+    conn, err = net.ListenUDP("udp4", addrV4)
+}
+\end{lstlisting}
+
+Le port local est laissé à 0 pour que le système d'exploitation choisisse un port disponible, évitant ainsi les conflits « Address already in use ».
+
+\subsubsection{Se connecter au serveur}
+
+Après avoir ouvert le socket, on détermine quelle adresse du serveur utiliser :
+
+\begin{lstlisting}[language=Go]
+if isDualStack {
+    targets = append(targets, protocol.GetServerUDPv6())
+}
+targets = append(targets, protocol.GetServerUDPv4())
+\end{lstlisting}
+
+Pour chaque adresse cible, on :
+\begin{enumerate}
+    \item Envoie un \texttt{Hello} signé avec notre clé
+    \item On attend une réponse (max 2 secondes)
+    \item On vérifie que c'est la bonne réponse
+\end{enumerate}
+
+\subsection{Double enregistrement Dual-Stack}
+
+Quand on est connecté en IPv6, on envoie aussi un ping sur IPv4 pour que le serveur nous enregistre sur les deux :
+
+\begin{lstlisting}[language=Go]
+if isDualStack && targetStr == protocol.GetServerUDPv6() {
+    if otherAddr, err := net.ResolveUDPAddr("udp", 
+                         protocol.GetServerUDPv4()); err == nil {
+        SendHello(conn, otherAddr, name, privKey)
+    }
+}
+\end{lstlisting}
+
+\subsection{Gestion des adresses multiples par pair}
+
+On stocke toutes les adresses (IPv4 et IPv6) de chaque utilisateur :
+
+\begin{lstlisting}[language=Go]
+type PeerInfo struct {
+    Name      string
+    Addrs     []AddrInfo
+    PublicKey *ecdsa.PublicKey
+    LastSeen  time.Time
+    IsRelay   bool
+}
+
+type AddrInfo struct {
+    Addr     *net.UDPAddr
+    LastSeen time.Time
+}
+\end{lstlisting}
+
+Quand on reçoit une adresse d'un utilisateur, on :
+
+\begin{itemize}
+    \item IPv4 connu → On remplace l'ancienne adresse IPv4
+    \item IPv6 connu → On remplace l'ancienne adresse IPv6
+    \item Nouveau protocole → On l'ajoute
+\end{itemize}
+
+\section*{Crédits}
+
+Ce projet a été réalisé avec l'aide des ressources suivantes :
+
+\begin{itemize}
+    \item \textbf{Documentation officielle} : Go standard library documentation
+    \begin{itemize}
+        \item \texttt{sync} : https://golang.org/pkg/sync/
+        \item \texttt{time} : https://golang.org/pkg/time/
+    \end{itemize}
+    \item \textbf{Cours Université Paris Cité} : Programmation Réseau(mutex), Programmation Orientée Objet(structs, interfaces)
+    \item \textbf{Ressources externes} : 
+    \begin{itemize}
+        \item \texttt{Merkle tree} : https://fr.wikipedia.org/wiki/Arbre\_de\_Merkle
+        \item \texttt{Fenêtre glissante} : https://fr.wikipedia.org/wiki/Fenêtre\_glissante
+    \end{itemize}
+\end{itemize}
+
+\end{document}

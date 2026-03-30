@@ -1,5 +1,6 @@
 package protocol
 
+// Types de messages UDP
 const (
 	Ping = 0
 	Ok   = 128
@@ -9,8 +10,6 @@ const (
 	Hello      = 1
 	HelloReply = 130
 
-	Timeout = 5
-
 	RootRequest = 2
 	RootReply   = 131
 
@@ -18,13 +17,13 @@ const (
 	Datum        = 132
 	NoDatum      = 133
 
-	NoTraversalRequest  = 4
-	NoTraversalRequest2 = 4
+	NatTraversalRequest  = 4
+	NatTraversalRequest2 = 5
 
-	URL        = "https://jch.irif.fr:8443/peers/"
-	ServerUDP6 = "[2001:660:3301:9243::51c2:1ee5]:8443"
-	ServerUDP4 = "81.194.30.229:8443"
+	// Bit 0 : je suis un relais NAT
+	ExtNatTraversalRelay = 1
+)
 
-	MyName   = "heeeeey"
-	FILENAME = "client_key.pem"
+var (
+	DebugEnabled = false
 )

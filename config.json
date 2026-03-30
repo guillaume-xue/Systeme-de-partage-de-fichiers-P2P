@@ -1,0 +1,66 @@
+{
+  "peer": {
+    "name": "heee1",
+    "keyfile": "client_key.pem",
+    "shared_dir": "shared",
+    "expiry_timeout_minutes": 5
+  },
+  "server": {
+    "url": "https://jch.irif.fr:8443/peers/",
+    "ipv4_address": "81.194.30.229:8443",
+    "ipv6_address": "[2001:660:3301:9243::51c2:1ee5]:8443"
+  },
+  "network": {
+    "timeout_seconds": 3,
+    "keepalive_seconds": 120,
+    "max_window_size": 256,
+    "initial_window": 10,
+    "min_window_size": 2,
+    "timeout_seconds_download": 3,
+    "processor_workers": 20,
+
+    "max_packet_workers": 100,
+    "udp_read_buffer_size": 65535,
+    "worker_overflow_timeout_ms": 100,
+    "fetch_max_retries": 3,
+
+    "handshake_timeout_seconds": 2,
+    "handshake_buffer_size": 2048,
+
+    "min_rto_ms": 50,
+
+    "sender_wait_ms": 10,
+    "monitor_interval_ms": 200,
+    "completion_confirm_delay_ms": 100,
+    "download_max_retries": 3,
+    "max_queue_size": 1024,
+
+    "disk_sender_tick_ms": 5,
+    "disk_monitor_interval_ms": 500,
+    "disk_completion_confirm_delay_ms": 200,
+
+    "http_client_timeout_seconds": 5,
+
+    "download_timeout_minutes": 5,
+    "resolve_datum_timeout_seconds": 3,
+    "root_reply_timeout_seconds": 3,
+    "startup_delay_ms": 1000,
+    "direct_connect_delay_ms": 500
+  },
+  "merkle": {
+    "max_chunk_size": 1024,
+    "max_dir_entries": 16,
+    "max_big_children": 32,
+    "watch_interval_seconds": 5
+  },
+  "nat": {
+    "response_channel_size": 10,
+    "ping_count": 3,
+    "initial_ping_delay_seconds": 1,
+    "final_timeout_ms": 500,
+    "default_relay_peer": "jch.irif.fr",
+    "ping_spam_count": 3,
+    "ping_spam_final_timeout_ms": 500,
+    "menu_response_channel_size": 10
+  }
+}

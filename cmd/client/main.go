@@ -1,22 +1,125 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
+	"main/internal/config"
+	"main/internal/crypto"
+	"main/internal/menu"
+	"main/internal/merkle"
 	"main/internal/transport"
 	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
 )
 
 func main() {
-	// Créer/ouvrir le fichier de log
-	logFile, err := os.OpenFile("server.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		log.Fatal("Erreur lors de la création du fichier log:", err)
+	// Setup pour gérer CTRL+c
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Gestion des signaux système (SIGINT, SIGTERM)
+	// Qui aurait cru que j'allait devoir réimplémenter ça après les cours de L2...
+	sigChan := make(chan os.Signal, 1) // 1 Suffit en général, on reçoit un signal à la fois
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Reception résultat du programme
+	done := make(chan error, 1)
+
+	go func() {
+		done <- run(ctx)
+	}()
+
+	select {
+	case sig := <-sigChan:
+		// Cas: CTRL+C
+		fmt.Printf("\nℹ️️ Signal reçu (%v), fermeture en cours...\n", sig)
+		cancel() // On prévient run() qu'il faut arrêter via le contexte
+	case err := <-done:
+		// Cas: Le menu est quitté ou une erreur critique survient
+		if err != nil {
+			log.Fatalf("❌ Erreur critique : %v\n", err)
+		}
+		fmt.Println("\n✅ Application terminée normalement.")
 	}
-	defer logFile.Close()
+}
 
-	// Rediriger stdout et stderr vers le fichier
-	os.Stdout = logFile
-	os.Stderr = logFile
+// Programme principal
+func run(ctx context.Context) error {
+	fmt.Println("\n======= Client P2P - Système de fichiers =======")
+	fmt.Println()
 
-	transport.RunServerUDP()
+	// Chargement de la configuration
+	cfg := config.LoadOrDefault("config.json")
+	fmt.Printf("✅ Configuration chargée (Peer: %s)\n", cfg.Peer.Name)
+
+	// Identité & Crypto
+	privKey, err := crypto.LoadOrGenerateKey(cfg.Peer.KeyFile)
+	if err != nil {
+		return fmt.Errorf("❌ Impossible de charger la clé: %w", err)
+	}
+	fmt.Println("✅ Clé privée chargée")
+
+	// Enregistrement HTTP
+	if err := transport.RegisterHTTP(privKey); err != nil {
+		return fmt.Errorf("❌ Impossible de s'enregistrer: %w", err)
+	}
+	fmt.Println("✅ Clé publique enregistrée sur le serveur HTTP")
+
+	// Connexion UDP
+	conn, serverAddr, err := transport.TryConnectWithFallback(cfg.Peer.Name, privKey)
+	if err != nil {
+		return fmt.Errorf("❌ Impossible de se connecter au serveur UDP: %w", err)
+	}
+	defer conn.Close()
+	fmt.Printf("✅ Connecté au serveur UDP (%s) [Mode: %s]\n", serverAddr, transport.GetNetworkMode())
+
+	// Initialisation du Serveur P2P
+	server := transport.NewServer(conn, privKey, cfg.Peer.Name)
+
+	// Charger le dossier partagé dans le Merkle tree ou la créer s'il n'existe pas
+	sharedDir := filepath.Join(".", cfg.Peer.SharedDir)
+	if _, err := os.Stat(sharedDir); os.IsNotExist(err) {
+		if err := os.Mkdir(sharedDir, 0755); err != nil {
+			return fmt.Errorf("❌ Impossible de créer le dossier partagé: %w", err)
+		}
+		fmt.Println("✅ Dossier partagé créé")
+	}
+	store := merkle.NewStore()
+	rootHash, err := merkle.DirToMerkle(store, sharedDir)
+	if err != nil {
+		return fmt.Errorf("❌ Impossible de charger le dossier partagé: %w", err)
+	}
+	server.SetMerkleRoot(store, rootHash)
+	fmt.Printf("✅ Dossier partagé chargé (root: %x...)\n", rootHash)
+
+	// Surveillance automatique du dossier partagé
+	go merkle.WatchSharedDir(ctx, sharedDir, cfg.Merkle.WatchInterval, func(newStore *merkle.Store, newRoot [32]byte) {
+		server.SetMerkleRoot(newStore, newRoot)
+	})
+	fmt.Printf("✅ Surveillance du dossier partagé activée (intervalle: %v)\n", cfg.Merkle.WatchInterval)
+
+	// Démarrage des services
+	// Routine d'écoute
+	go server.ListenLoop(ctx)
+	fmt.Println("✅ Routine d'écoute UDP démarrée")
+
+	// Routine keep-alive
+	go server.KeepAlive(ctx, serverAddr, cfg.Network.KeepAlive)
+	fmt.Printf("✅ Keep-alive activé (%v)\n", cfg.Network.KeepAlive)
+
+	time.Sleep(time.Duration(cfg.Network.StartupDelayMs) * time.Millisecond) // Laisser le temps de tout initialiser avec les precedents requetes
+
+	fmt.Println("\n✅ Client démarré!")
+	fmt.Printf("   Nom: %s\n", cfg.Peer.Name)
+	fmt.Printf("   Serveur: %s\n", serverAddr)
+
+	// Interface Utilisateur
+	interactiveMenu := menu.NewMenu(server, serverAddr)
+	interactiveMenu.Run(ctx)
+
+	return nil
 }

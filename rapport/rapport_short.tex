@@ -1,0 +1,98 @@
+\documentclass[11pt,a4paper]{report}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{geometry}
+
+\geometry{margin=2.5cm}
+
+% Configuration pour les listings de code
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  stringstyle=\color{red}
+}
+
+\title{Rapport de Projet\\Programmation Internet\\Système de Partage de Fichiers P2P}
+\author{Guillaume Xue : 22101031 \\ David Yu : 22110478}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\chapter{Introduction}
+
+Ce projet implémente un système de partage de fichiers P2P utilisant UDP, un serveur central pour la découverte des pairs et un arbre de Merkle pour garantir l'intégrité des données.
+
+\section{Objectifs}
+
+\begin{itemize}
+    \item S'enregistrer auprès d'un serveur central
+    \item Partager et télécharger des fichiers via P2P
+    \item Traverser les NAT avec relais
+    \item Gérer efficacement les transferts avec fenêtre glissante
+\end{itemize}
+
+\section{Architecture}
+
+L'implémentation en Go s'articule autour de : Transport UDP, Merkle (hashing fichiers), Crypto (ECDSA), Peer Manager, Protocol.
+
+\section{Enregistrement au serveur}
+
+\subsection{Clé publique et adresse IP}
+La clé publique ECDSA est envoyée en PUT au serveur central. Le client établit un socket UDP dual-stack (IPv6 avec fallback IPv4) et effectue un handshake Hello/HelloReply avec le serveur.
+
+\subsection{Keep-Alive}
+Un mécanisme de keep-alive envoie périodiquement des pings (tous les 3min) au serveur central et à tous les pairs connectés pour maintenir les mappings NAT et détecter les pairs inactifs.
+
+\section{Partage et téléchargement}
+
+\subsection{Arbre de Merkle}
+Chaque fichier/répertoire est représenté par un arbre de Merkle (SHA-256). Types : Chunk (données brutes, 1024 max), Directory (16 entrées), Big (32 chunks), BigDirectory (32 répertoires).
+
+\subsection{Téléchargement avec fenêtre glissante}
+Le downloader utilise 3 workers : SenderLoop (envoie requêtes), ResponseLoop (traite réponses), MonitorLoop (gère timeouts). La fenêtre s'ajuste dynamiquement en fonction des performances réseau.
+
+\section{Fonctionnalités avancées}
+
+\subsection{NAT Traversal}
+Les clients derrière NAT peuvent communiquer via un relais (pair avec extension \texttt{NatTraversalRelay}). Processus : 
+\begin{enumerate}
+    \item Source demande au relais
+    \item Relais notifie la cible
+    \item Les deux exécutent du hole punching simultané avec backoff exponentiel (0s, 1s, 2s)
+    \item NAT crée des mappings permettant la connexion directe
+\end{enumerate}
+
+\subsection{Autres fonctionnalités}
+Interface CLI interactive, support natif IPv4/IPv6 (dual-stack avec fallback), PeerManager gère les adresses multiples de chaque pair, keep-alive multi-protocoles.
+
+\section*{Crédits}
+
+Ce projet a été réalisé avec l'aide des ressources suivantes :
+
+\begin{itemize}
+    \item \textbf{Documentation officielle} : Go standard library documentation
+    \begin{itemize}
+        \item \texttt{sync} : https://golang.org/pkg/sync/
+        \item \texttt{time} : https://golang.org/pkg/time/
+    \end{itemize}
+    \item \textbf{Cours Université Paris Cité} : Programmation Réseau(mutex), Programmation Orientée Objet(structs, interfaces)
+    \item \textbf{Ressources externes} : 
+    \begin{itemize}
+        \item \texttt{Merkle tree} : https://fr.wikipedia.org/wiki/Arbre\_de\_Merkle
+        \item \texttt{Fenêtre glissante} : https://fr.wikipedia.org/wiki/Fenêtre\_glissante
+    \end{itemize}
+\end{itemize}
+
+\end{document}

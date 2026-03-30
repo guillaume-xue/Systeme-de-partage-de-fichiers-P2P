@@ -3,142 +3,129 @@ package transport
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"crypto/tls"
 	"fmt"
 	"io"
+	"main/internal/config"
 	"main/internal/crypto"
 	"main/internal/protocol"
-	"net"
 	"net/http"
 	"strings"
 	"time"
 )
 
+// Client global avec un timeout pour ne pas freezer l'app si l'annuaire est down
+var httpClient *http.Client
+
+func getHTTPClient() *http.Client {
+	if httpClient == nil {
+		timeout := 5 * time.Second
+		if config.GlobalConfig != nil {
+			timeout = config.GlobalConfig.Network.HTTPClientTimeout
+		}
+		httpClient = &http.Client{
+			Timeout: timeout,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true, // Ignore la vérification des certificats SSL
+				},
+			},
+		}
+	}
+	return httpClient
+}
+
+// GetListPeers récupère la liste des noms enregistrés
 func GetListPeers() ([]string, error) {
-	resp, err := http.Get(protocol.URL)
+	body, status, err := httpGetWithTimeout(protocol.GetURL())
 	if err != nil {
-		return nil, fmt.Errorf("failed to get peers: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, err
 	}
 
+	if status != 200 {
+		return nil, fmt.Errorf("bad status: %d", status)
+	}
+
+	// Parsing simple : une ligne = un peer
 	lines := strings.Split(string(body), "\n")
 	var peers []string
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			peers = append(peers, line)
+
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l != "" {
+			peers = append(peers, l)
 		}
 	}
 	return peers, nil
 }
 
-func GetAddr(name string) ([]byte, error) {
-	resp, err := http.Get(protocol.URL + name + "/addresses")
+// httpGetWithTimeout effectue une requête GET avec timeout et gestion d'erreur
+func httpGetWithTimeout(url string) ([]byte, int, error) {
+	resp, err := getHTTPClient().Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get address: %w", err)
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, resp.StatusCode, err
 	}
-	return body, nil
+
+	return body, resp.StatusCode, nil
 }
 
+// GetAddr récupère la string des adresses d'un peer
+func GetAddr(name string) (string, error) {
+	url := protocol.GetURL() + name + "/addresses"
+	body, _, err := httpGetWithTimeout(url)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}
+
+// GetKey récupère la clé publique brute (64 bytes)
 func GetKey(name string) ([]byte, error) {
-	resp, err := http.Get(protocol.URL + name + "/key")
+	url := protocol.GetURL() + name + "/key"
+	body, status, err := httpGetWithTimeout(url)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get key: %w", err)
+		return nil, err
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+	if status == 404 {
+		return nil, fmt.Errorf("peer not found")
 	}
+
 	return body, nil
 }
 
-func RegisterHTTP(privateKey *ecdsa.PrivateKey) error {
-	pubKey := crypto.ExtractPublicKey(privateKey)
-	pubBytes := crypto.PublicKeyToBytes(pubKey)
+// RegisterHTTP publie notre clé publique sur l'annuaire
+func RegisterHTTP(privKey *ecdsa.PrivateKey) error {
+	// 1. Préparation des données
+	pubKey := crypto.ExtractPublicKey(privKey)
+	keyBytes := crypto.PublicKeyToBytes(pubKey)
 
-	url := fmt.Sprintf(protocol.URL + protocol.MyName + "/key")
-	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(pubBytes))
+	// 2. Création requête
+	myName := config.GlobalConfig.Peer.Name
+	url := protocol.GetURL() + myName + "/key"
+	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(keyBytes))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	// 3. Envoi
+	resp, err := getHTTPClient().Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 && resp.StatusCode != 204 {
-		return fmt.Errorf("erreur serveur HTTP: %s", resp.Status)
+	// 200 OK ou 204 No Content sont acceptés
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("registration failed: %s", resp.Status)
 	}
 
 	return nil
-}
-
-func SendPacket(conn *net.UDPConn, destAddr *net.UDPAddr, msgID uint32, msgType uint8, data []byte) error {
-
-	var packet []byte
-
-	switch msgType {
-	case protocol.Ping:
-		packet = protocol.EncodeMessages(msgID, protocol.Ping, []byte{})
-	case protocol.Ok:
-		packet = protocol.EncodeMessages(msgID, protocol.Ok, []byte{})
-	case protocol.Hello:
-		myName := protocol.MyName
-		packet = protocol.EncodeHandshakeMessage(msgID, protocol.Hello, 0, []byte(myName))
-	case protocol.HelloReply:
-		myName := protocol.MyName
-		packet = protocol.EncodeHandshakeMessage(msgID, protocol.HelloReply, 0, []byte(myName))
-	case protocol.RootRequest:
-		packet = protocol.EncodeRootAndData(msgID, protocol.RootRequest, []byte{})
-	case protocol.RootReply:
-		packet = protocol.EncodeRootAndData(msgID, protocol.RootReply, []byte{})
-	case protocol.DatumRequest:
-		packet = protocol.EncodeRootAndData(msgID, protocol.DatumRequest, data)
-	default:
-		return fmt.Errorf("type de message inconnu: %d", msgType)
-	}
-
-	_, err := conn.WriteToUDP(packet, destAddr)
-	if err != nil {
-		return fmt.Errorf("erreur envoi Message: %w", err)
-	}
-
-	fmt.Printf("Message type %d envoyé à %s (ID:%d)\n", msgType, destAddr, msgID)
-	return nil
-}
-
-func RegisterClient(conn4 *net.UDPConn, conn6 *net.UDPConn) {
-	privKey, _ := crypto.LoadOrGenerateKey(protocol.FILENAME)
-
-	fmt.Println("Port UDP 8080 ouvert pour écoute et envoi.")
-
-	if err := RegisterHTTP(privKey); err != nil {
-		fmt.Println("Erreur HTTP:", err)
-	}
-
-	serverAddr6, _ := net.ResolveUDPAddr("udp", protocol.ServerUDP6)
-	serverAddr4, _ := net.ResolveUDPAddr("udp", protocol.ServerUDP4)
-
-	if err := SendPacket(conn6, serverAddr6, uint32(time.Now().Unix()), protocol.Hello, []byte{}); err != nil {
-		fmt.Println("Erreur envoi Hello:", err)
-	}
-	if err := SendPacket(conn4, serverAddr4, uint32(time.Now().Unix()), protocol.Hello, []byte{}); err != nil {
-		fmt.Println("Erreur envoi Hello:", err)
-	}
 }

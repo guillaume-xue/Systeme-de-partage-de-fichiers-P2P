@@ -13,6 +13,10 @@ import (
 	"os"
 )
 
+/*
+	Fonctions données par le prof
+*/
+
 // GeneratePrivateKey crée une nouvelle clé privée ECDSA.
 func GeneratePrivateKey() *ecdsa.PrivateKey {
 	rprivateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -75,13 +79,14 @@ func VerifySignature(publicKey *ecdsa.PublicKey, data []byte, signature []byte) 
 	return ok
 }
 
+// LoadOrGenerateKey charge une clé privée depuis un fichier ou en génère une nouvelle si le fichier n'existe pas.
 func LoadOrGenerateKey(filename string) (*ecdsa.PrivateKey, error) {
 	fileData, err := os.ReadFile(filename)
 
 	if err == nil {
 		block, _ := pem.Decode(fileData)
 		if block == nil || block.Type != "EC PRIVATE KEY" {
-			return nil, fmt.Errorf("format de clé invalide dans %s", filename)
+			return nil, fmt.Errorf("Format de clé invalide dans %s", filename)
 		}
 		privateKey, err := x509.ParseECPrivateKey(block.Bytes)
 		if err != nil {
